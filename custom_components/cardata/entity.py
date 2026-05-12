@@ -18,9 +18,10 @@ class CardataEntity(RestoreEntity):
         self._coordinator = coordinator
         self._vin = vin
         self._descriptor = descriptor
+        self._attr_has_entity_name = True
         self._attr_unique_id = f"{vin}_{descriptor}"
         self._base_name = self._format_name()
-        self._attr_name = self._compute_full_name()
+        self._attr_name = self._base_name
         self._attr_available = True
         self._name_unsub: Callable[[], None] | None = None
 
@@ -56,14 +57,6 @@ class CardataEntity(RestoreEntity):
         attrs = {}
         if state.timestamp:
             attrs["timestamp"] = state.timestamp
-        metadata = self._coordinator.device_metadata.get(self._vin)
-        if metadata:
-            extra = metadata.get("extra_attributes")
-            if extra:
-                attrs.setdefault("vehicle_basic_data", dict(extra))
-            raw = metadata.get("raw_data")
-            if raw:
-                attrs.setdefault("vehicle_basic_data_raw", dict(raw))
         return attrs
 
     @property
@@ -85,23 +78,8 @@ class CardataEntity(RestoreEntity):
         title = " ".join(p.capitalize() for p in parts)
         return title or self._vin
 
-    def _get_vehicle_name(self) -> Optional[str]:
-        metadata = self._coordinator.device_metadata.get(self._vin)
-        if metadata and metadata.get("name"):
-            return metadata["name"]
-        return self._coordinator.names.get(self._vin)
-
-    def _compute_full_name(self) -> str:
-        base = self._base_name or self._vin
-        vehicle_name = self._get_vehicle_name()
-        if not vehicle_name:
-            return base
-        if base.lower().startswith(vehicle_name.lower()):
-            return base
-        return f"{vehicle_name} {base}"
-
     def _update_name(self, *, write_state: bool = True) -> None:
-        new_name = self._compute_full_name()
+        new_name = self._base_name or self._vin
         if new_name == self._attr_name:
             return
         self._attr_name = new_name

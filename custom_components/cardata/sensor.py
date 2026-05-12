@@ -23,21 +23,151 @@ from .const import DOMAIN
 from .coordinator import CardataCoordinator
 from .entity import CardataEntity
 
+TRACKER_ONLY_DESCRIPTORS = {
+    "vehicle.cabin.infotainment.navigation.currentLocation.latitude",
+    "vehicle.cabin.infotainment.navigation.currentLocation.longitude",
+    "vehicle.cabin.infotainment.navigation.currentLocation.heading",
+}
+
+DIAGNOSTIC_SENSOR_DESCRIPTORS = {
+    "vehicle.vehicle.timeSetting",
+    "vehicle.channel.ngtp.timeVehicle",
+    "vehicle.cabin.infotainment.isMobilePhoneConnected",
+    "vehicle.cabin.infotainment.displayUnit.distance",
+    "vehicle.cabin.infotainment.hmi.distanceUnit",
+    "vehicle.cabin.infotainment.navigation.currentLocation.altitude",
+    "vehicle.cabin.infotainment.navigation.currentLocation.fixStatus",
+    "vehicle.cabin.infotainment.navigation.currentLocation.numberOfSatellites",
+    "vehicle.cabin.infotainment.navigation.destinationSet.latitude",
+    "vehicle.cabin.infotainment.navigation.destinationSet.longitude",
+    "vehicle.cabin.infotainment.navigation.destinationSet.arrivalTime",
+    "vehicle.cabin.infotainment.navigation.remainingRange",
+    "vehicle.cabin.infotainment.navigation.pointsOfInterests.max",
+    "vehicle.channel.teleservice.status",
+    "vehicle.channel.teleservice.lastAutomaticServiceCallTime",
+    "vehicle.channel.teleservice.lastTeleserviceReportTime",
+    "vehicle.channel.teleservice.lastBreakdownCallTime",
+    "vehicle.channel.teleservice.lastManualCallTime",
+    "vehicle.electronicControlUnit.diagnosticTroubleCodes.raw",
+    "vehicle.serviceDemand.defect.id",
+    "vehicle.sevice.preferredSevicePartner",
+    "vehicle.status.checkControlMessages",
+    "vehicle.status.conditionBasedServices",
+    "vehicle.status.conditionBasedServicesCount",
+    "vehicle.status.conditionBasedServicesAverageDistancePerDay",
+    "vehicle.status.serviceDistance.yellow",
+    "vehicle.status.serviceTime.yellow",
+    "vehicle.status.serviceTime.hUandAuServiceYellow",
+}
+
+TIMESTAMP_SENSOR_DESCRIPTORS = {
+    "vehicle.trip.segment.end.time",
+    "vehicle.status.serviceTime.inspectionDateLegal",
+    "vehicle.channel.teleservice.lastAutomaticServiceCallTime",
+    "vehicle.channel.teleservice.lastTeleserviceReportTime",
+    "vehicle.channel.teleservice.lastBreakdownCallTime",
+    "vehicle.channel.teleservice.lastManualCallTime",
+    "vehicle.cabin.infotainment.navigation.destinationSet.arrivalTime",
+}
+
 
 class CardataSensor(CardataEntity, SensorEntity):
     def __init__(self, coordinator: CardataCoordinator, vin: str, descriptor: str) -> None:
         super().__init__(coordinator, vin, descriptor)
         self._attr_should_poll = False
         self._unsubscribe = None
-        if self._descriptor == "vehicle.vehicle.travelledDistance":
+        self._apply_descriptor_metadata()
+
+    def _apply_descriptor_metadata(self) -> None:
+        descriptor = self._descriptor
+        if descriptor in TIMESTAMP_SENSOR_DESCRIPTORS:
+            self._attr_device_class = SensorDeviceClass.TIMESTAMP
+        elif descriptor == "vehicle.vehicle.travelledDistance":
             self._attr_state_class = SensorStateClass.TOTAL_INCREASING
+            self._attr_device_class = SensorDeviceClass.DISTANCE
+        elif descriptor.endswith(".travelledDistance") or descriptor.endswith(".referenceDistance"):
+            self._attr_device_class = SensorDeviceClass.DISTANCE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith("remainingRange") or descriptor.endswith("remainingFuel"):
+            self._attr_device_class = SensorDeviceClass.DISTANCE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith(".stateOfCharge") or descriptor.endswith(".target") or descriptor.endswith(".targetMin"):
+            self._attr_device_class = SensorDeviceClass.BATTERY
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith(".stateOfHealth.displayed"):
+            self._attr_device_class = SensorDeviceClass.BATTERY
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        elif descriptor.endswith(".level") and "fuelSystem" in descriptor:
+            self._attr_device_class = SensorDeviceClass.BATTERY
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith("remainingTime") or descriptor.endswith("timeToFullyCharged"):
+            self._attr_device_class = SensorDeviceClass.DURATION
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith(".header") or descriptor.endswith(".level"):
+            self._attr_device_class = SensorDeviceClass.BATTERY
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith(".power"):
+            self._attr_device_class = SensorDeviceClass.POWER
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith(".acVoltage") or descriptor.endswith(".voltage"):
+            self._attr_device_class = SensorDeviceClass.VOLTAGE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith(".acAmpere"):
+            self._attr_device_class = SensorDeviceClass.CURRENT
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith(".temperature"):
+            self._attr_device_class = SensorDeviceClass.TEMPERATURE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith(".pressure") or descriptor.endswith(".pressureTarget"):
+            self._attr_device_class = SensorDeviceClass.PRESSURE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        elif descriptor.endswith(".gridEnergy"):
+            self._attr_device_class = SensorDeviceClass.ENERGY
+            self._attr_state_class = SensorStateClass.TOTAL_INCREASING
+        elif descriptor.endswith(".fuel"):
+            self._attr_state_class = SensorStateClass.TOTAL_INCREASING
+        elif descriptor.endswith(".hour") or descriptor.endswith(".minute"):
+            self._attr_entity_category = EntityCategory.CONFIG
+        elif descriptor.endswith(".action") or descriptor.endswith(".preference") or descriptor.endswith(".mode"):
+            self._attr_entity_category = EntityCategory.CONFIG
+        elif descriptor.endswith(".latitude") or descriptor.endswith(".longitude"):
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        elif descriptor.endswith(".heading"):
+            self._attr_icon = "mdi:compass"
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        elif descriptor.endswith(".altitude"):
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        elif descriptor.endswith(".numberOfSatellites"):
+            self._attr_icon = "mdi:satellite-variant"
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        elif descriptor.endswith(".fixStatus"):
+            self._attr_icon = "mdi:crosshairs-gps"
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        elif "service" in descriptor or "diagnosis" in descriptor:
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+
+        if "tire" in descriptor:
+            self._attr_icon = "mdi:car-tire-alert"
+        elif "chargingPort" in descriptor or ".flap." in descriptor:
+            self._attr_icon = "mdi:ev-plug-type2"
+        elif "preConditioning" in descriptor or "preconditioning" in descriptor:
+            self._attr_icon = "mdi:car-clock"
+        elif "conditionBasedServices" in descriptor or "service" in descriptor:
+            self._attr_icon = "mdi:wrench"
+
+        if descriptor in DIAGNOSTIC_SENSOR_DESCRIPTORS:
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
     
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         if getattr(self, "_attr_native_value", None) is None:
             last_state = await self.async_get_last_state()
             if last_state and last_state.state not in ("unknown", "unavailable"):
-                self._attr_native_value = last_state.state
+                if self._attr_device_class == SensorDeviceClass.TIMESTAMP:
+                    parsed = dt_util.parse_datetime(last_state.state)
+                    self._attr_native_value = parsed or last_state.state
+                else:
+                    self._attr_native_value = last_state.state
                 unit = last_state.attributes.get("unit_of_measurement")
                 if unit is not None:
                     self._attr_native_unit_of_measurement = unit
@@ -73,7 +203,11 @@ class CardataSensor(CardataEntity, SensorEntity):
         state = self._coordinator.get_state(vin, descriptor)
         if not state:
             return
-        self._attr_native_value = state.value
+        if self._attr_device_class == SensorDeviceClass.TIMESTAMP and isinstance(state.value, str):
+            parsed = dt_util.parse_datetime(state.value)
+            self._attr_native_value = parsed or state.value
+        else:
+            self._attr_native_value = state.value
         self._attr_native_unit_of_measurement = state.unit
 
         self.schedule_update_ha_state()
@@ -388,12 +522,7 @@ async def async_setup_entry(
             return
         
         # Filter out location descriptors - these are used by device_tracker only
-        location_descriptors = [
-            "vehicle.cabin.infotainment.navigation.currentLocation.latitude",
-            "vehicle.cabin.infotainment.navigation.currentLocation.longitude",
-            "vehicle.cabin.infotainment.navigation.currentLocation.heading",
-        ]
-        if descriptor in location_descriptors:
+        if descriptor in TRACKER_ONLY_DESCRIPTORS:
             return
         
         state = coordinator.get_state(vin, descriptor)

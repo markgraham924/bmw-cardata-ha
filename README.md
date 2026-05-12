@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="logo.png" alt="BimmerData Streamline logo" width="240" />
+  <img src="logo.png" alt="BimmerData Streamline MG logo" width="240" />
 </p>
 
-# BimmerData Streamline (BMW CarData for Home Assistant)
+# BimmerData Streamline MG (BMW CarData for Home Assistant)
 
 ## This is experimental. 
 I'm developing this on my free time with personal use cases as highest priority. Main goal was to get it running ASAP when BMW killed the old API, so the code quality wasn't priority at all. So far the plugin has been surprisingly stable even after bigger (AI Agent assisted) edits, but there's always a risk that something falls through, due to nonexistent automatic testing and me not doing a completely fresh install every time I test a new feature.
@@ -11,7 +11,7 @@ I'm developing this on my free time with personal use cases as highest priority.
 The Beta branch is used as a day to day development branch and can contain completely broken stuff, please don't use it or report bugs from it unless specifically asked for. The main branch is updated when I feel that it works well enough and has something worth to publish.
 
 ## Issues / Discussion
-Please try to post only issues relevant to the integration itself on the [Issues](https://github.com/JjyKsi/bmw-cardata-ha/issues) and keep all the outside discussion (problems with registration on BMWs side, asking for guidance, etc) in the discussions: [Discussions](https://github.com/JjyKsi/bmw-cardata-ha/discussions) It's not an end of the world if it's in the wrong place, but moving them around makes extra work for me which is away from the development. 
+Please try to post only issues relevant to this fork on the [Issues](https://github.com/markgraham924/bmw-cardata-ha/issues). Upstream project discussion still lives at [JjyKsi/bmw-cardata-ha](https://github.com/JjyKsi/bmw-cardata-ha).
 
 
 ## Release Notes: 
@@ -118,12 +118,12 @@ The CarData web portal isn’t available everywhere (e.g., it’s disabled in Fi
 ## Installation (HACS)
 
 1. Add this repo to HACS as a **custom repository** (type: Integration).
-2. Install "BimmerData Streamline" from the Custom section.
+2. Install "BimmerData Streamline MG" from the Custom section.
 3. Restart Home Assistant.
 
 ## Configuration Flow
 
-1. Go to **Settings → Devices & Services → Add Integration** and pick **BimmerData Streamline**.
+1. Go to **Settings → Devices & Services → Add Integration** and pick **BimmerData Streamline MG**.
 2. Enter your CarData **client ID** (created in the BMW portal).
 3. The flow displays a `verification_url` and `user_code`. Open the link, enter the code, and approve the device.
 4. Once the BMW portal confirms the approval, return to HA and click Submit. If you accidentally submit before finishing the BMW login, the flow will hang until the device-code exchange times out; cancel it and start over after completing the BMW login.

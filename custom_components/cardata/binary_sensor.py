@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Dict, Tuple
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity import EntityCategory
 
 from .const import DOMAIN
 from .coordinator import CardataCoordinator
@@ -20,6 +22,38 @@ class CardataBinarySensor(CardataEntity, BinarySensorEntity):
         super().__init__(coordinator, vin, descriptor)
         self._attr_should_poll = False
         self._unsubscribe = None
+        self._apply_descriptor_metadata()
+
+    def _apply_descriptor_metadata(self) -> None:
+        descriptor = self._descriptor
+        if descriptor.endswith(".isOpen"):
+            self._attr_device_class = BinarySensorDeviceClass.OPENING
+        elif descriptor.endswith(".isLocked"):
+            self._attr_device_class = BinarySensorDeviceClass.LOCK
+        elif descriptor.endswith(".alarm.isOn"):
+            self._attr_device_class = BinarySensorDeviceClass.SAFETY
+        elif descriptor.endswith(".isIgnitionOn") or descriptor.endswith(".isActive"):
+            self._attr_device_class = BinarySensorDeviceClass.RUNNING
+        elif descriptor.endswith(".isRunningOn"):
+            self._attr_device_class = BinarySensorDeviceClass.LIGHT
+        elif descriptor.endswith(".isPlugged"):
+            self._attr_device_class = BinarySensorDeviceClass.PLUG
+        elif descriptor.endswith(".deepSleepModeActive"):
+            self._attr_device_class = BinarySensorDeviceClass.POWER
+
+        if (
+            "serviceDemand" in descriptor
+            or "preConditioning.isRemoteEngineRunning" in descriptor
+            or "isRemoteEngineStartAllowed" in descriptor
+        ):
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        elif (
+            "alarm" in descriptor
+            or "chargingPort" in descriptor
+            or ".flap." in descriptor
+            or ".isPlugged" in descriptor
+        ):
+            self._attr_icon = "mdi:ev-plug-type2" if "charging" in descriptor or "chargingPort" in descriptor else None
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
