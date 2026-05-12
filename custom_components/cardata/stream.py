@@ -172,9 +172,9 @@ class CardataStreamManager:
         client.on_disconnect = self._handle_disconnect
         context = ssl.create_default_context()
         if hasattr(ssl, "TLSVersion"):
+            # Require modern TLS, but let OpenSSL negotiate the newest version
+            # the BMW broker supports instead of pinning us to exactly TLS 1.2.
             context.minimum_version = ssl.TLSVersion.TLSv1_2
-            if hasattr(context, "maximum_version"):
-                context.maximum_version = ssl.TLSVersion.TLSv1_2
         client.tls_set_context(context)
         client.tls_insecure_set(False)
         client.reconnect_delay_set(min_delay=5, max_delay=60)
