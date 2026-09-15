@@ -1,0 +1,88 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "BMW Cardata",
+        "description": "Inserisci il tuo ID client BMW CarData."
+      },
+      "authorize": {
+        "title": "Autorizza BMW CarData",
+        "description": "Apri {verification_url} e inserisci il codice utente {user_code} se richiesto. Una volta approvato il dispositivo, fai clic su Invia. Se l'approvazione è già stata completata, fai nuovamente clic su Invia per continuare."
+      },
+      "blocked": {
+        "title": "Bootstrap disabilitato a causa del limite di velocità API",
+        "description": "L'integrazione ha precedentemente raggiunto il limite giornaliero dell'API BMW e il bootstrap automatico (creazione container e mappatura) è stato temporaneamente disabilitato per {entry_title} fino a {until}. Puoi attendere fino a quel momento e riprovare, oppure cancellare il flag qui sotto per riprovare immediatamente (potresti raggiungere nuovamente il limite di velocità)."
+      },
+      "cleared": {
+        "title": "Nuovo tentativo di bootstrap pianificato",
+        "description": "Hai cancellato il flag di disabilitazione temporanea per {entry_title}. L'integrazione tenterà nuovamente il bootstrap. Se il limite dell'API BMW viene raggiunto di nuovo, l'integrazione disabiliterà il bootstrap fino all'orario di ripristino. In alternativa, usa il servizio sviluppatore `cardata.clean_hv_containers` per elencare/eliminare vecchi container (fai attenzione ai limiti dell'API)."
+      },
+      "blocked_fallback": {
+        "description": "Il bootstrap automatico è disabilitato fino a {until}. Cancella il flag per riprovare ora, oppure annulla e riprova dopo il ripristino."
+      }
+    },
+    "error": {
+      "authorization_failed": "L'autorizzazione BMW non è stata completata. Questo può accadere se hai cliccato su \"Rifiuta\", hai chiuso la pagina prima di approvare, la richiesta è scaduta, oppure i server BMW hanno avuto un problema temporaneo (non è sempre colpa tua). Dettagli dell'errore: {error}. Qui sotto è stato generato un nuovo link di autorizzazione: aprilo e approva, poi clicca di nuovo su Invia.",
+      "device_code_failed": "BMW ha rifiutato la richiesta di autorizzazione del dispositivo ({error}). Verifica che l'ID client sia valido e riprova."
+    },
+    "abort": {
+      "auth_failed": "La risposta di autorizzazione BMW era incompleta (token mancanti). Riprova.",
+      "reauth_device_code_failed": "BMW ha rifiutato la richiesta di autorizzazione del dispositivo ({error}). Aggiorna l'ID client in Configura > Riavvia autorizzazione dispositivo, oppure rimuovi e aggiungi nuovamente l'integrazione.",
+      "reauth_missing_client_id": "L'ID client manca per questa voce di integrazione. Rimuovi e aggiungi nuovamente l'integrazione per autorizzarti di nuovo.",
+      "reauth_failed": "La riautorizzazione non è stata avviata. Riprova dalle opzioni dell'integrazione."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Azioni manuali",
+        "description": "Seleziona l'azione che vuoi eseguire. Aggiorna token tenta semplicemente di rinnovare i token senza riautorizzazione. Ti consigliamo di riavviare HA dopo se riscontri problemi."
+      },
+      "action_settings": {
+        "title": "Impostazioni",
+        "data": {
+          "enable_magic_soc": "Abilita Magic SOC (previsione consumo in guida)",
+          "enable_trip_end_polling": "Abilita polling fine viaggio",
+          "trip_poll_cooldown_minutes": "Attesa tra polling fine viaggio (minuti)"
+        }
+      },
+      "action_mqtt_broker": {
+        "title": "Broker MQTT",
+        "description": "Configura un broker MQTT personalizzato al posto dell'endpoint BMW. Usalo con bmw-mqtt-bridge per riprodurre i dati BMW da un broker locale, consentendo a più consumatori di condividere una singola connessione MQTT BMW.",
+        "data": {
+          "custom_mqtt_enabled": "Usa broker MQTT personalizzato",
+          "custom_mqtt_host": "Host del broker",
+          "custom_mqtt_port": "Porta del broker",
+          "custom_mqtt_username": "Nome utente (opzionale)",
+          "custom_mqtt_password": "Password (opzionale)",
+          "custom_mqtt_tls": "Modalità TLS",
+          "custom_mqtt_topic_prefix": "Prefisso topic (es. bmw/)"
+        },
+        "data_description": {
+          "custom_mqtt_enabled": "Quando abilitato, si connette al tuo broker personalizzato invece dell'endpoint MQTT di BMW.",
+          "custom_mqtt_host": "Nome host o indirizzo IP del tuo broker MQTT.",
+          "custom_mqtt_port": "Numero di porta (predefinito: 1883 per TCP, 8883 per TLS).",
+          "custom_mqtt_username": "Lasciare vuoto per accesso anonimo.",
+          "custom_mqtt_password": "Lasciare vuoto per accesso anonimo.",
+          "custom_mqtt_tls": "Disattivato = TCP non crittografato, TLS = certificato verificato, TLS (autofirmato) = ignora la validazione del certificato.",
+          "custom_mqtt_topic_prefix": "Il prefisso topic del bridge. I messaggi sono attesi su '{prefix}{vin}'. Predefinito: bmw/"
+        }
+      }
+    },
+    "error": {
+      "refresh_failed": "Aggiornamento token fallito: {error}",
+      "runtime_missing": "L'ambiente di esecuzione dell'integrazione non è pronto. Riprova dopo il completamento della configurazione.",
+      "no_vins": "Nessun VIN è ancora noto. Attendi che lo stream rilevi un veicolo o attivalo manualmente una volta.",
+      "invalid_int": "Inserisci un numero intero positivo",
+      "invalid_client_id": "Inserisci l'ID client BMW CarData.",
+      "mqtt_host_required": "L'host del broker è obbligatorio quando il broker MQTT personalizzato è abilitato."
+    },
+    "abort": {
+      "auth_failed": "La risposta di autorizzazione BMW era incompleta (token mancanti). Riprova.",
+      "reauth_started": "Autorizzazione riavviata. Completa il nuovo flusso di accesso dalla notifica.",
+      "reauth_device_code_failed": "BMW ha rifiutato la richiesta di autorizzazione del dispositivo ({error}). Aggiorna l'ID client nelle opzioni dell'integrazione e riprova.",
+      "reauth_missing_client_id": "L'ID client manca per questa voce di integrazione. Rimuovi e aggiungi nuovamente l'integrazione per autorizzarti di nuovo.",
+      "reauth_failed": "La riautorizzazione non è stata avviata. Riprova dalle opzioni dell'integrazione."
+    }
+  }
+}

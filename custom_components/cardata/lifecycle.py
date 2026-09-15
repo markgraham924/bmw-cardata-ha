@@ -1,0 +1,713 @@
+# Copyright (c) 2025, Renaud Allard <renaud@allard.it>, Kris Van Biesen <kvanbiesen@gmail.com>, fdebrus, Jyri Saukkonen <jyri.saukkonen+jjyksi@gmail.com>, Tobias Kritten <mail@tobiaskritten.de>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+"""Setup and unload orchestration for the BMW CarData integration."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from contextlib import suppress
+
+import aiohttp
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.storage import Store
+
+from .auth import (
+    async_ensure_container_for_entry,
+    async_token_refresh_loop,
+    handle_stream_error,
+    refresh_tokens_for_entry,
+)
+from .bootstrap import async_run_bootstrap
+from .const import (
+    ALLOWED_VINS_KEY,
+    BOOTSTRAP_COMPLETE,
+    DEBUG_LOG,
+    DEFAULT_CUSTOM_MQTT_PORT,
+    DEFAULT_CUSTOM_MQTT_TOPIC_PREFIX,
+    DEFAULT_STREAM_HOST,
+    DEFAULT_STREAM_PORT,
+    DEFAULT_TRIP_POLL_COOLDOWN_MINUTES,
+    DESC_FUEL_LEVEL,
+    DESC_REMAINING_FUEL,
+    DESC_SOC_HEADER,
+    DIAGNOSTIC_LOG_INTERVAL,
+    DOMAIN,
+    MAGIC_SOC_DESCRIPTOR,
+    MQTT_KEEPALIVE,
+    OPTION_CUSTOM_MQTT_ENABLED,
+    OPTION_CUSTOM_MQTT_HOST,
+    OPTION_CUSTOM_MQTT_PASSWORD,
+    OPTION_CUSTOM_MQTT_PORT,
+    OPTION_CUSTOM_MQTT_TLS,
+    OPTION_CUSTOM_MQTT_TOPIC_PREFIX,
+    OPTION_CUSTOM_MQTT_USERNAME,
+    OPTION_DEBUG_LOG,
+    OPTION_DIAGNOSTIC_INTERVAL,
+    OPTION_ENABLE_CHARGING_HISTORY,
+    OPTION_ENABLE_MAGIC_SOC,
+    OPTION_ENABLE_TRIP_POLL,
+    OPTION_ENABLE_TYRE_DIAGNOSIS,
+    OPTION_MQTT_KEEPALIVE,
+    OPTION_TRIP_POLL_COOLDOWN,
+    SOC_LEARNING_STORAGE_KEY,
+    SOC_LEARNING_STORAGE_VERSION,
+)
+from .container import CardataContainerManager
+from .coordinator import CardataCoordinator
+from .debug import set_debug_enabled
+from .device_flow import CardataAuthError
+from .frontend_cards import async_setup_frontend_cards, async_unload_frontend_cards_if_last_entry
+from .metadata import async_restore_vehicle_images, async_restore_vehicle_metadata
+from .runtime import CardataRuntimeData, async_update_entry_data, cleanup_entry_lock
+from .services import async_register_services, async_unregister_services
+from .stream import CardataStreamManager
+from .telematics import async_telematic_poll_loop
+from .utils import (
+    async_cancel_task,
+    get_externally_owned_vins,
+    partition_restored_vins,
+    redact_vin,
+    redact_vins,
+    validate_and_clamp_option,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+PLATFORMS: list[Platform] = [
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.DEVICE_TRACKER,
+    Platform.IMAGE,
+    Platform.BUTTON,
+    Platform.NUMBER,
+]
+
+
+async def _async_cleanup_on_failure(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    refresh_task: asyncio.Task | None,
+) -> None:
+    """Clean up all tasks and resources on setup failure."""
+    # Cancel refresh task with proper exception handling
+    if refresh_task:
+        refresh_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await refresh_task
+
+    # Clean up runtime data tasks if they were created
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if runtime:
+        if runtime.bootstrap_task:
+            runtime.bootstrap_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await runtime.bootstrap_task
+
+        if runtime.telematic_task:
+            runtime.telematic_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await runtime.telematic_task
+
+        # Stop coordinator watchdog if started
+        await runtime.coordinator.async_stop_watchdog()
+
+        # Stop MQTT stream to prevent orphaned background thread
+        try:
+            await asyncio.wait_for(runtime.stream.async_stop(), timeout=10.0)
+        except TimeoutError:
+            _LOGGER.warning("MQTT stream stop timed out during cleanup")
+        except Exception as err:
+            _LOGGER.debug("Error stopping MQTT stream during cleanup: %s", err)
+
+    hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+
+
+def _make_options_listener(initial_options: dict):
+    """Create an update listener that reloads only when options change."""
+    prev_options = dict(initial_options)
+
+    async def _listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+        nonlocal prev_options
+        current = dict(entry.options) if entry.options else {}
+        if current != prev_options:
+            prev_options = current
+            await hass.config_entries.async_reload(entry.entry_id)
+
+    return _listener
+
+
+async def async_setup_cardata(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up CarData from a config entry."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+
+    _LOGGER.debug("Setting up Bmw Cardata Streamline entry %s", entry.entry_id)
+
+    await async_setup_frontend_cards(hass)
+
+    session: aiohttp.ClientSession | None = None
+    refresh_task: asyncio.Task | None = None
+    setup_succeeded = False
+
+    try:
+        session = aiohttp.ClientSession()
+        # Prepare configuration
+        data = entry.data
+        options = dict(entry.options) if entry.options else {}
+
+        # Validate and clamp mqtt_keepalive (10-300 seconds)
+        mqtt_keepalive = validate_and_clamp_option(
+            options.get(OPTION_MQTT_KEEPALIVE, MQTT_KEEPALIVE),
+            min_val=10,
+            max_val=300,
+            default=MQTT_KEEPALIVE,
+            option_name="mqtt_keepalive",
+        )
+
+        # Validate and clamp diagnostic_interval (10-3600 seconds)
+        diagnostic_interval = validate_and_clamp_option(
+            options.get(OPTION_DIAGNOSTIC_INTERVAL, DIAGNOSTIC_LOG_INTERVAL),
+            min_val=10,
+            max_val=3600,
+            default=DIAGNOSTIC_LOG_INTERVAL,
+            option_name="diagnostic_interval",
+        )
+
+        debug_option = options.get(OPTION_DEBUG_LOG)
+        debug_flag = DEBUG_LOG if debug_option is None else bool(debug_option)
+
+        set_debug_enabled(debug_flag)
+
+        # Validate required credentials
+        client_id = data["client_id"]
+        gcid = data.get("gcid")
+        id_token = data.get("id_token")
+        if not gcid or not id_token:
+            raise ConfigEntryNotReady("Missing GCID or ID token")
+
+        # Set up coordinator
+        coordinator = CardataCoordinator(hass=hass, entry_id=entry.entry_id)
+        coordinator.diagnostic_interval = diagnostic_interval
+        coordinator.enable_magic_soc = bool(options.get(OPTION_ENABLE_MAGIC_SOC, False))
+        coordinator.enable_charging_history = bool(options.get(OPTION_ENABLE_CHARGING_HISTORY, False))
+        coordinator.enable_tyre_diagnosis = bool(options.get(OPTION_ENABLE_TYRE_DIAGNOSIS, False))
+
+        # Store session start time for ghost cleanup
+        # This prevents removing devices that existed before this HA restart
+        coordinator.session_start_time = time.time()
+
+        # Set up SOC learning storage
+        soc_learning_store: Store = Store(
+            hass, SOC_LEARNING_STORAGE_VERSION, f"{SOC_LEARNING_STORAGE_KEY}.{entry.entry_id}"
+        )
+
+        # Load SOC session data (v1 learned efficiency or v2 full session state)
+        try:
+            stored_learning = await soc_learning_store.async_load()
+            if stored_learning and isinstance(stored_learning, dict):
+                coordinator._soc_predictor.load_session_data(stored_learning)
+                coordinator._magic_soc.load_session_data(stored_learning)
+        except Exception as err:
+            _LOGGER.warning("Failed to load SOC learning data: %s", err)
+
+        # Set up persistence callback for learning updates
+        async def _save_learning_data() -> None:
+            """Save SOC session data to storage."""
+            try:
+                data_to_save = {
+                    **coordinator._soc_predictor.get_session_data(),
+                    **coordinator._magic_soc.get_session_data(),
+                }
+                await soc_learning_store.async_save(data_to_save)
+                _LOGGER.debug("Saved SOC session data")
+            except Exception as err:
+                _LOGGER.warning("Failed to save SOC session data: %s", err)
+
+        def _trigger_save() -> None:
+            """Trigger async save from sync context."""
+            hass.async_create_task(_save_learning_data())
+
+        def _trigger_save_and_dispatch(*args) -> None:
+            """Trigger async save and dispatch efficiency signal for sensor updates."""
+            hass.async_create_task(_save_learning_data())
+            coordinator._safe_dispatcher_send(coordinator.signal_efficiency_learning, *args)
+
+        coordinator._soc_predictor.set_learning_callback(_trigger_save_and_dispatch)
+        coordinator._soc_predictor.set_save_callback(_trigger_save)
+        coordinator._magic_soc.set_learning_callback(_trigger_save)
+
+        # Restore stored vehicle metadata.
+        # last_telematic_api_at is deliberately not restored here: it feeds the
+        # "Last Telematics API Call" sensor and must only ever hold the time of a
+        # successful fetch, while the stored last_telematic_poll also records
+        # failed and rate limited attempts. The sensor restores its own state.
+        await async_restore_vehicle_metadata(hass, entry, coordinator)
+
+        # CRITICAL FIX: Pre-populate coordinator.names from restored device_metadata
+        # Entities check coordinator.names for the vehicle name prefix, so we must
+        # populate it BEFORE the MQTT stream starts and entities are created
+        for vin, metadata in coordinator.device_metadata.items():
+            if metadata and not coordinator.names.get(vin):
+                # Extract the name that was restored from metadata
+                vehicle_name = metadata.get("name")
+                if vehicle_name:
+                    coordinator.names[vin] = vehicle_name
+                    _LOGGER.debug(
+                        "Pre-populated coordinator.names for VIN %s with %s from restored metadata",
+                        redact_vin(vin),
+                        vehicle_name,
+                    )
+
+        # Restore allowed VINs from entry data (already deduplicated by bootstrap)
+        # This prevents VIN duplication across config entries on restart
+        # Note: We check for None explicitly to distinguish "not set" from "empty list"
+        # An empty list means all VINs were deduplicated to other entries (valid state)
+        stored_allowed_vins = data.get(ALLOWED_VINS_KEY)
+        if stored_allowed_vins is not None and isinstance(stored_allowed_vins, list):
+            coordinator._allowed_vins.update(stored_allowed_vins)
+            coordinator._allowed_vins_initialized = True
+            _LOGGER.debug(
+                "Restored %d allowed VIN(s) from entry data for entry %s",
+                len(stored_allowed_vins),
+                entry.entry_id,
+            )
+
+            # Reconcile restored metadata VINs against the allowed list. Metadata VINs
+            # missing from the allowed list are either duplicates owned by another
+            # config entry (remove them - existing cross-entry dedup behavior) or
+            # orphans owned by nobody, e.g. a non-PRIMARY mapped vehicle that was
+            # dynamically claimed from MQTT but whose claim predates persistence.
+            # Orphans are adopted instead of destroyed; blindly removing them evicted
+            # the vehicle's device and entities on every restart (issue #402).
+            # Ownership must consider the PERSISTED allowed lists of other entries
+            # too, because entry load order at startup is nondeterministic.
+            from homeassistant.helpers import device_registry as dr
+
+            device_registry = dr.async_get(hass)
+            externally_owned = get_externally_owned_vins(hass, exclude_entry_id=entry.entry_id)
+            vins_to_remove, vins_to_adopt = partition_restored_vins(
+                list(coordinator.device_metadata.keys()),
+                coordinator._allowed_vins,
+                externally_owned,
+            )
+            for vin in vins_to_remove:
+                coordinator.device_metadata.pop(vin, None)
+                coordinator.names.pop(vin, None)
+                # Also remove device from registry IF it belongs to this entry
+                # (was created by async_restore_vehicle_metadata for this entry)
+                device = device_registry.async_get_device(identifiers={(DOMAIN, vin)})
+                if device and entry.entry_id in device.config_entries:
+                    device_registry.async_remove_device(device.id)
+                    _LOGGER.info(
+                        "Removed device for VIN %s (owned by another config entry)",
+                        redact_vin(vin),
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Removed VIN %s from coordinator (owned by another config entry)",
+                        redact_vin(vin),
+                    )
+            if vins_to_adopt:
+                coordinator._allowed_vins.update(vins_to_adopt)
+                for vin in vins_to_adopt:
+                    _LOGGER.info(
+                        "Adopting VIN %s into allowed list (present in this entry's metadata, "
+                        "not owned by any other entry)",
+                        redact_vin(vin),
+                    )
+                await async_update_entry_data(hass, entry, {ALLOWED_VINS_KEY: sorted(coordinator._allowed_vins)})
+        else:
+            _LOGGER.warning(
+                "No allowed VINs key in entry data for entry %s - will force bootstrap to run",
+                entry.entry_id,
+            )
+
+        # Check if metadata is already available from restoration
+        has_metadata = bool(coordinator.names)
+        redacted_names = redact_vins(coordinator.names.keys()) if has_metadata else "empty"
+        _LOGGER.debug(
+            "Metadata restored for entry %s: %s (names: %s)",
+            entry.entry_id,
+            "yes" if has_metadata else "no",
+            redacted_names,
+        )
+
+        # Set up container manager
+        container_manager: CardataContainerManager | None = CardataContainerManager(
+            session=session,
+            entry_id=entry.entry_id,
+            initial_container_id=data.get("hv_container_id"),
+        )
+
+        # Set up stream manager
+        async def handle_stream_error_callback(reason: str) -> None:
+            await handle_stream_error(hass, entry, reason)
+
+        # Check for custom MQTT broker configuration
+        options = dict(entry.options)
+        custom_mqtt_enabled = options.get(OPTION_CUSTOM_MQTT_ENABLED, False)
+
+        if custom_mqtt_enabled:
+            mqtt_host = options.get(OPTION_CUSTOM_MQTT_HOST, "")
+            mqtt_port = options.get(OPTION_CUSTOM_MQTT_PORT, DEFAULT_CUSTOM_MQTT_PORT)
+        else:
+            mqtt_host = data.get("mqtt_host", DEFAULT_STREAM_HOST)
+            mqtt_port = data.get("mqtt_port", DEFAULT_STREAM_PORT)
+
+        manager = CardataStreamManager(
+            hass=hass,
+            client_id=client_id,
+            gcid=gcid,
+            id_token=id_token,
+            host=mqtt_host,
+            port=mqtt_port,
+            keepalive=mqtt_keepalive,
+            error_callback=handle_stream_error_callback,
+            entry_id=entry.entry_id,
+            custom_broker=custom_mqtt_enabled,
+            custom_mqtt_username=options.get(OPTION_CUSTOM_MQTT_USERNAME),
+            custom_mqtt_password=options.get(OPTION_CUSTOM_MQTT_PASSWORD),
+            custom_mqtt_tls=options.get(OPTION_CUSTOM_MQTT_TLS, "off"),
+            custom_mqtt_topic_prefix=options.get(OPTION_CUSTOM_MQTT_TOPIC_PREFIX, DEFAULT_CUSTOM_MQTT_TOPIC_PREFIX),
+        )
+        manager.set_message_callback(coordinator.async_handle_message)
+        manager.set_status_callback(coordinator.async_handle_connection_event)
+
+        # Restore circuit breaker state from previous session
+        circuit_breaker_state = data.get("circuit_breaker_state")
+        if circuit_breaker_state:
+            manager.restore_circuit_breaker_state(circuit_breaker_state)
+
+        # CRITICAL: Prevent MQTT from auto-starting during token refresh
+        # Set a flag that we'll clear after bootstrap completes
+        manager._bootstrap_in_progress = True
+
+        # Attempt initial token refresh
+        refreshed_token = False
+        try:
+            await refresh_tokens_for_entry(entry, session, manager, container_manager)
+            refreshed_token = True
+        except CardataAuthError as err:
+            _LOGGER.warning(
+                "Initial token refresh failed for entry %s: %s; continuing with stored token",
+                entry.entry_id,
+                err,
+            )
+        except Exception as err:
+            raise ConfigEntryNotReady(f"Initial token refresh failed: {err}") from err
+
+        # Ensure HV container if token refresh didn't succeed
+        if not refreshed_token and container_manager:
+            container_ready = await async_ensure_container_for_entry(entry, hass, container_manager)
+            if not container_ready and not container_manager.container_id:
+                _LOGGER.error(
+                    "No HV container available for entry %s; "
+                    "telematic data polling will be unavailable until container is created",
+                    entry.entry_id,
+                )
+
+        # MQTT auto-start is now prevented by _bootstrap_in_progress flag
+        # We'll explicitly start it after bootstrap completes
+
+        # Create runtime data FIRST (before refresh task so the task can read it)
+        runtime_data = CardataRuntimeData(
+            stream=manager,
+            refresh_task=None,
+            session=session,
+            coordinator=coordinator,
+            container_manager=container_manager,
+            bootstrap_task=None,
+            telematic_task=None,
+            reauth_in_progress=False,
+            reauth_flow_id=None,
+        )
+        runtime_data.soc_store = soc_learning_store
+        runtime_data.enable_trip_poll = bool(options.get(OPTION_ENABLE_TRIP_POLL, True))
+        cooldown_min = options.get(OPTION_TRIP_POLL_COOLDOWN, DEFAULT_TRIP_POLL_COOLDOWN_MINUTES)
+        runtime_data.trip_poll_cooldown_seconds = max(1, int(cooldown_min)) * 60
+        hass.data[DOMAIN][entry.entry_id] = runtime_data
+
+        # Now create refresh loop (runtime is stored, task can read it after first sleep)
+        refresh_task = hass.loop.create_task(async_token_refresh_loop(hass, entry.entry_id))
+        runtime_data.refresh_task = refresh_task
+
+        # Register services if not already done
+        if not domain_data.get("_service_registered"):
+            async_register_services(hass)
+            domain_data["_service_registered"] = True
+
+        # Start bootstrap FIRST (before MQTT and before setting up platforms)
+        # This ensures we fetch vehicle metadata before any entities are created
+        # Also force bootstrap if allowed_vins key is missing (metadata corruption/loss)
+        # Note: We check for key existence, not emptiness - an empty list means all VINs
+        # were deduplicated to other entries, which is a valid state that doesn't need bootstrap
+        has_allowed_vins_key = data.get(ALLOWED_VINS_KEY) is not None
+        should_bootstrap = not data.get(BOOTSTRAP_COMPLETE) or not has_allowed_vins_key
+        bootstrap_error: str | None = None
+        bootstrap_completed = False
+        if should_bootstrap:
+            _LOGGER.debug("Starting bootstrap to fetch vehicle metadata before creating entities")
+
+            runtime_data.bootstrap_task = hass.loop.create_task(async_run_bootstrap(hass, entry))
+
+            # Wait for bootstrap task to FULLY complete (including async_seed_telematic_data)
+            # This ensures coordinator.names is populated AND telematic data is seeded
+            # before we set up platforms (which create entities)
+            try:
+                await asyncio.wait_for(runtime_data.bootstrap_task, timeout=30.0)
+                bootstrap_completed = True
+                _LOGGER.debug("Bootstrap completed successfully")
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Bootstrap did not complete within 30 seconds. Devices will update names when metadata arrives."
+                )
+                # Cancel the timed-out task to prevent it running in background
+                try:
+                    await async_cancel_task(runtime_data.bootstrap_task)
+                except Exception as cancel_err:
+                    _LOGGER.debug("Error cancelling bootstrap task: %s", cancel_err)
+                runtime_data.bootstrap_task = None
+            except Exception as err:
+                _LOGGER.warning("Bootstrap failed: %s", err)
+                bootstrap_error = str(err)
+                runtime_data.bootstrap_task = None
+
+        # Check if we have vehicle names after bootstrap attempt
+        # If bootstrap was required and explicitly failed, abort setup
+        if should_bootstrap and bootstrap_error:
+            error_message = bootstrap_error
+            # Create a persistent notification in the UI for visibility
+            await hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "BMW CarData Setup Failed",
+                    "message": f"Bootstrap failed to retrieve vehicle metadata: {error_message}.",
+                    "notification_id": f"{DOMAIN}_{entry.entry_id}_bootstrap_failed",
+                },
+            )
+            raise ConfigEntryNotReady(f"Bootstrap failed to retrieve vehicle metadata: {error_message}. ")
+        # If bootstrap completed but produced no names, continue with VIN placeholders
+        if should_bootstrap and bootstrap_completed and not coordinator.names:
+            _LOGGER.warning("Bootstrap completed without vehicle names; continuing setup with VIN placeholders.")
+        # NOW clear the bootstrap flag and signal completion event
+        # This ensures MQTT doesn't create entities before we have vehicle names
+        # IMPORTANT: Set event FIRST, then clear flag - ensures waiters unblock
+        # before other code sees the flag cleared (avoids inconsistent state)
+        manager._bootstrap_complete_event.set()
+        manager._bootstrap_in_progress = False
+
+        if manager.client is None:
+            try:
+                _LOGGER.debug("Starting MQTT connection after bootstrap")
+                await manager.async_start()
+            except Exception as err:
+                if refreshed_token:
+                    raise ConfigEntryNotReady(f"Unable to connect to BMW MQTT after token refresh: {err}") from err
+                raise ConfigEntryNotReady(f"Unable to connect to BMW MQTT: {err}") from err
+
+        # Start coordinator watchdog
+        await coordinator.async_start_watchdog()
+
+        # Restore vehicle images from disk before platform setup (only after bootstrap)
+        # This ensures images fetched during bootstrap are properly loaded into metadata
+        # (bootstrap saves images but the dispatcher signal may not reach the image platform yet)
+        # Note: On restart, async_restore_vehicle_metadata already calls this, and the
+        # allowed_vins cleanup runs after - we must NOT call it again or it would
+        # re-add VINs that were just cleaned up (breaking multi-account setups)
+        if bootstrap_completed:
+            await async_restore_vehicle_images(hass, entry, coordinator)
+
+        # NOW set up platforms - coordinator.names should be populated        # Forward setup to platforms
+        # If metadata was restored or fetched by bootstrap, coordinator.names will have car names
+        # If not (timeout), entities will be created with VINs temporarily and updated later
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+        # Create Magic SOC entities for eligible BEV VINs
+        # Must run AFTER platform setup so coordinator.data is populated (entity restore)
+        # and the sensor platform's ensure_entity callback is registered
+        if coordinator.enable_magic_soc and coordinator._create_sensor_callback:
+            for vin, vehicle_state in list(coordinator.data.items()):
+                has_battery = DESC_SOC_HEADER in vehicle_state
+                has_fuel = DESC_REMAINING_FUEL in vehicle_state or DESC_FUEL_LEVEL in vehicle_state
+                is_phev = has_fuel and not coordinator._is_metadata_bev(vin)
+                if has_battery and not is_phev and MAGIC_SOC_DESCRIPTOR not in vehicle_state:
+                    coordinator._create_sensor_callback(vin, MAGIC_SOC_DESCRIPTOR)
+                    if coordinator._create_consumption_reset_callback:
+                        coordinator._create_consumption_reset_callback(vin)
+                    _LOGGER.info("Magic SOC entity created for VIN %s", redact_vin(vin))
+
+        # Start telematic polling loop
+        runtime_data.telematic_task = hass.loop.create_task(async_telematic_poll_loop(hass, entry.entry_id))
+
+        # Schedule ghost device cleanup to run after MQTT has had time to populate telemetry
+        # This runs on BOTH initial setup and restart to remove ghost devices
+        # The cleanup function has age checks to prevent removing legitimately new devices
+
+        async def _delayed_cleanup():
+            """Run ghost device cleanup after 10 minutes."""
+            from homeassistant.helpers import device_registry as dr
+
+            from .metadata import async_cleanup_ghost_devices
+
+            await asyncio.sleep(600)  # Wait 10 minutes for MQTT telemetry to populate
+
+            device_registry = dr.async_get(hass)
+            _LOGGER.debug("Running scheduled ghost device cleanup for entry %s", entry.entry_id)
+
+            try:
+                await async_cleanup_ghost_devices(hass, entry, coordinator, device_registry)
+            except Exception as err:
+                _LOGGER.warning("Scheduled ghost device cleanup failed for entry %s: %s", entry.entry_id, err)
+
+        # Create background task and register for cleanup on unload
+        # Use async_create_background_task so HA bootstrap doesn't wait for this 10-minute task
+        cleanup_task = hass.async_create_background_task(
+            _delayed_cleanup(),
+            name=f"{DOMAIN}_ghost_cleanup_{entry.entry_id}",
+        )
+
+        def _cancel_cleanup() -> None:
+            if not cleanup_task.done():
+                cleanup_task.cancel()
+
+        entry.async_on_unload(_cancel_cleanup)
+
+        # Reload integration when options change (Magic SOC toggle, debug, keepalive, etc.)
+        entry.async_on_unload(entry.add_update_listener(_make_options_listener(options)))
+
+        setup_succeeded = True
+        return True
+
+    except ConfigEntryNotReady:
+        # Expected exception for setup retries - re-raise without extra logging
+        raise
+
+    except (TimeoutError, aiohttp.ClientError) as err:
+        # Network/timeout errors - expected during connectivity issues
+        _LOGGER.warning("Setup failed due to network error: %s", err)
+        raise ConfigEntryNotReady(f"Network error during setup: {err}") from err
+
+    except Exception as err:
+        # Unexpected errors - log with full traceback for debugging
+        _LOGGER.exception("Setup failed with unexpected error: %s", err)
+        raise
+
+    finally:
+        # Cleanup on any failure path
+        if not setup_succeeded:
+            await _async_cleanup_on_failure(hass, entry, refresh_task)
+            if session and not session.closed:
+                await session.close()
+
+
+async def _cancel_task_with_timeout(task: asyncio.Task, name: str, timeout: float = 5.0) -> None:
+    """Cancel an asyncio task and wait for it to finish, with timeout protection."""
+    task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=timeout)
+    except asyncio.CancelledError:
+        pass
+    except TimeoutError:
+        _LOGGER.warning("%s task did not cancel within timeout (%.0fs). Proceeding with unload anyway.", name, timeout)
+    except Exception as err:
+        _LOGGER.error("Error stopping %s task: %s", name, err)
+
+
+async def async_unload_cardata(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    domain_data = hass.data.get(DOMAIN)
+    if not domain_data or entry.entry_id not in domain_data:
+        # Still clean up the lock even if no runtime data
+        cleanup_entry_lock(entry.entry_id)
+        return True
+
+    data: CardataRuntimeData = domain_data.pop(entry.entry_id)
+
+    # Save SOC session data before shutdown
+    if data.soc_store is not None:
+        try:
+            session_data = {
+                **data.coordinator._soc_predictor.get_session_data(),
+                **data.coordinator._magic_soc.get_session_data(),
+            }
+            await data.soc_store.async_save(session_data)
+        except Exception as err:
+            _LOGGER.warning("Failed to save SOC session data on shutdown: %s", err)
+
+    # Stop coordinator
+    await data.coordinator.async_stop_watchdog()
+
+    # Unload platforms
+    await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+    # Cancel tasks with timeout protection
+    for task, name in [
+        (data.refresh_task, "Refresh"),
+        (data.bootstrap_task, "Bootstrap"),
+        (data.telematic_task, "Telematic"),
+    ]:
+        if task:
+            await _cancel_task_with_timeout(task, name)
+
+    # Stop MQTT stream with timeout protection
+    try:
+        await asyncio.wait_for(data.stream.async_stop(), timeout=10.0)
+    except TimeoutError:
+        _LOGGER.warning("MQTT stream stop timed out after 10 seconds. Proceeding with unload anyway.")
+    except Exception as err:
+        _LOGGER.error("Error stopping MQTT stream: %s", err)
+
+    try:
+        await data.session.close()
+    except Exception as err:
+        _LOGGER.error("Error closing aiohttp session: %s", err)
+
+    # Clean up services if this is the last entry
+    remaining_entries = [k for k in domain_data.keys() if not k.startswith("_")]
+    if not remaining_entries:
+        async_unregister_services(hass)
+        await async_unload_frontend_cards_if_last_entry(hass)
+        domain_data.pop("_service_registered", None)
+        domain_data.pop("_registered_services", None)
+
+    if not domain_data or not remaining_entries:
+        hass.data.pop(DOMAIN, None)
+
+    # Clean up the per-entry lock
+    cleanup_entry_lock(entry.entry_id)
+
+    # Dismiss any container mismatch notifications
+    from homeassistant.components import persistent_notification
+
+    notification_id = f"{DOMAIN}_container_mismatch_{entry.entry_id}"
+    persistent_notification.async_dismiss(hass, notification_id)
+
+    return True

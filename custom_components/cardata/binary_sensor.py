@@ -1,131 +1,278 @@
+# Copyright (c) 2025, Renaud Allard <renaud@allard.it>, Kris Van Biesen <kvanbiesen@gmail.com>, Jyri Saukkonen <jyri.saukkonen+jjyksi@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
 """Binary sensor platform for BMW CarData."""
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+import logging
+from collections.abc import Callable
 
-from homeassistant.components.binary_sensor import BinarySensorEntity
-from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.entity_registry import (
+    async_entries_for_config_entry,
+    async_get,
+)
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import DOMAIN
 from .coordinator import CardataCoordinator
 from .entity import CardataEntity
+from .runtime import CardataRuntimeData
+from .utils import async_wait_for_bootstrap
+
+_LOGGER = logging.getLogger(__name__)
+
+DOOR_NON_DOOR_DESCRIPTORS = (
+    "vehicle.body.trunk.isOpen",
+    "vehicle.body.hood.isOpen",
+    "vehicle.body.trunk.door.isOpen",
+    "vehicle.body.trunk.left.door.isOpen",
+    "vehicle.body.trunk.lower.door.isOpen",
+    "vehicle.body.trunk.right.door.isOpen",
+    "vehicle.body.trunk.upper.door.isOpen",
+)
+
+DOOR_DESCRIPTORS = (
+    "vehicle.cabin.door.row1.driver.isOpen",
+    "vehicle.cabin.door.row1.passenger.isOpen",
+    "vehicle.cabin.door.row2.driver.isOpen",
+    "vehicle.cabin.door.row2.passenger.isOpen",
+)
+
+MOTION_DESCRIPTORS = ("vehicle.isMoving",)
 
 
-class CardataBinarySensor(CardataEntity, BinarySensorEntity):
+class CardataBinarySensor(CardataEntity, RestoreEntity, BinarySensorEntity):
+    """Binary sensor for boolean telematic data."""
+
+    _attr_should_poll = False
+
     def __init__(self, coordinator: CardataCoordinator, vin: str, descriptor: str) -> None:
         super().__init__(coordinator, vin, descriptor)
-        self._attr_should_poll = False
-        self._unsubscribe = None
-        self._apply_descriptor_metadata()
+        self._unsubscribe: Callable[[], None] | None = None
 
-    def _apply_descriptor_metadata(self) -> None:
-        descriptor = self._descriptor
-        if descriptor.endswith(".isOpen"):
-            self._attr_device_class = BinarySensorDeviceClass.OPENING
-        elif descriptor.endswith(".isLocked"):
-            self._attr_device_class = BinarySensorDeviceClass.LOCK
-        elif descriptor.endswith(".alarm.isOn"):
-            self._attr_device_class = BinarySensorDeviceClass.SAFETY
-        elif descriptor.endswith(".isIgnitionOn") or descriptor.endswith(".isActive"):
-            self._attr_device_class = BinarySensorDeviceClass.RUNNING
-        elif descriptor.endswith(".isRunningOn"):
-            self._attr_device_class = BinarySensorDeviceClass.LIGHT
-        elif descriptor.endswith(".isPlugged"):
-            self._attr_device_class = BinarySensorDeviceClass.PLUG
-        elif descriptor.endswith(".deepSleepModeActive"):
-            self._attr_device_class = BinarySensorDeviceClass.POWER
-
-        if (
-            "serviceDemand" in descriptor
-            or "preConditioning.isRemoteEngineRunning" in descriptor
-            or "isRemoteEngineStartAllowed" in descriptor
-        ):
-            self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        elif (
-            "alarm" in descriptor
-            or "chargingPort" in descriptor
-            or ".flap." in descriptor
-            or ".isPlugged" in descriptor
-        ):
-            self._attr_icon = "mdi:ev-plug-type2" if "charging" in descriptor or "chargingPort" in descriptor else None
+        if descriptor in DOOR_NON_DOOR_DESCRIPTORS or descriptor in DOOR_DESCRIPTORS:
+            self._attr_device_class = BinarySensorDeviceClass.DOOR
+        elif descriptor in MOTION_DESCRIPTORS:
+            self._attr_device_class = BinarySensorDeviceClass.MOVING
 
     async def async_added_to_hass(self) -> None:
+        """Restore state and subscribe to updates."""
         await super().async_added_to_hass()
+
+        # Re-signal entity existence for virtual sensors (critical after restart)
+        # Without this, coordinator won't schedule updates for derived motion state
+        if self._descriptor == "vehicle.isMoving":
+            self._coordinator._motion_detector.signal_entity_created(self._vin)
+
+        # Track if we restored state (to ensure fresh data updates it)
+        restored_state = False
+
         if getattr(self, "_attr_is_on", None) is None:
             last_state = await self.async_get_last_state()
             if last_state and last_state.state not in ("unknown", "unavailable"):
-                self._attr_is_on = last_state.state.lower() == "on"
+                # Special handling for vehicle.isMoving: don't restore state
+                # The motion detector loses GPS history on restart, so restored
+                # "moving" state would be stale. Let the coordinator provide fresh state.
+                if self.descriptor == "vehicle.isMoving":
+                    # Start with False (not moving) as safe default
+                    self._attr_is_on = False
+                else:
+                    self._attr_is_on = last_state.state.lower() == "on"
+                    restored_state = True
+
         self._unsubscribe = async_dispatcher_connect(
             self.hass,
             self._coordinator.signal_update,
             self._handle_update,
         )
+
+        # Get initial value from coordinator (may have arrived before we subscribed)
+        # If we restored state, check for fresh data to ensure we're not stuck with old value
+        if restored_state:
+            state = self._coordinator.get_state(self.vin, self.descriptor)
+            if state and isinstance(state.value, bool):
+                # Fresh data available - use it (may differ from restored value)
+                if self._attr_is_on != state.value:
+                    self._attr_is_on = state.value
+                    self.schedule_update_ha_state()
+
+        # Always do initial update to get current state from coordinator
+        # For isMoving: this gets the derived motion state from GPS tracking
+        # For other sensors: this ensures we have the latest MQTT data
         self._handle_update(self.vin, self.descriptor)
 
     async def async_will_remove_from_hass(self) -> None:
+        """Unsubscribe from updates."""
         await super().async_will_remove_from_hass()
         if self._unsubscribe:
             self._unsubscribe()
             self._unsubscribe = None
 
     def _handle_update(self, vin: str, descriptor: str) -> None:
+        """Handle incoming data updates from coordinator.
+
+        SMART FILTERING: Only updates Home Assistant if the binary sensor's
+        state actually changed. This prevents HA spam while ensuring sensors
+        restore from 'unknown' state after reload.
+        """
         if vin != self.vin or descriptor != self.descriptor:
             return
+
+        # Ghost cars (e.g. family sharing with limited access) are handled by
+        # async_cleanup_ghost_devices(), which removes the whole device after
+        # a grace period. Gating value display here on the *current* total
+        # descriptor count would permanently freeze legitimate low-descriptor
+        # vehicles at "unknown" once this handler's own descriptor stops
+        # updating, since it's never re-invoked just because some other
+        # descriptor later pushes the count over the threshold.
         state = self._coordinator.get_state(vin, descriptor)
         if not state or not isinstance(state.value, bool):
             return
-        self._attr_is_on = state.value
 
+        new_value = state.value
+
+        # SMART FILTERING: Check if sensor's current state differs from new value
+        current_value = getattr(self, "_attr_is_on", None)
+
+        # Only update HA if state actually changed or sensor is unknown
+        if current_value == new_value:
+            # Binary sensor already has this state - skip HA update!
+            # Example: Door lock stays "locked" for hours
+            # - Coordinator sends "locked" every 5 seconds
+            # - Binary sensor: "I'm already 'locked' → SKIP"
+            # - Result: No HA spam! [OK]
+            return
+
+        # State changed or sensor is unknown - update it!
+        self._attr_is_on = new_value
         self.schedule_update_ha_state()
 
+    @property
+    def icon(self) -> str | None:
+        """Return dynamic icon based on state."""
+        # Door sensors - dynamic icon based on state
+        if self.descriptor and self.descriptor in DOOR_DESCRIPTORS:
+            return "mdi:car-door"
 
-async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities
-) -> None:
-    runtime = hass.data[DOMAIN][entry.entry_id]
+        # Door non Door sensors - dynamic icon based on state
+        if self.descriptor and self.descriptor in DOOR_NON_DOOR_DESCRIPTORS:
+            is_open = getattr(self, "_attr_is_on", False)
+            if is_open:
+                return "mdi:circle-outline"
+            else:
+                return "mdi:circle"
+
+        # Motion sensors - dynamic icon based on state
+        if self.descriptor and self.descriptor in MOTION_DESCRIPTORS:
+            is_moving = getattr(self, "_attr_is_on", False)
+            if is_moving:
+                return "mdi:car-arrow-right"
+            else:
+                return "mdi:car-brake-parking"
+
+        # Return existing icon attribute if set
+        return getattr(self, "_attr_icon", None)
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
+    """Set up binary sensors for a config entry."""
+    runtime: CardataRuntimeData = hass.data[DOMAIN][entry.entry_id]
     coordinator: CardataCoordinator = runtime.coordinator
+    stream_manager = runtime.stream
 
-    entities: Dict[Tuple[str, str], CardataBinarySensor] = {}
+    # Wait for bootstrap to finish so VIN → name mapping exists.
+    await async_wait_for_bootstrap(stream_manager, context="Binary sensor setup")
 
-    def ensure_entity(vin: str, descriptor: str, *, assume_binary: bool = False) -> None:
+    entities: dict[tuple[str, str], CardataBinarySensor] = {}
+
+    def ensure_entity(vin: str, descriptor: str, *, assume_binary: bool = False, from_signal: bool = False) -> None:
+        """Ensure binary sensor entity exists for VIN + descriptor.
+
+        Args:
+            vin: Vehicle identification number.
+            descriptor: The telematic descriptor (e.g., "vehicle.cabin.door.row1.driver.isOpen").
+            assume_binary: If True, create entity even without coordinator state.
+                Used when restoring entities from entity registry.
+            from_signal: If True, trust the signal and create entity even without
+                coordinator state. Used when called from dispatcher signals.
+        """
         if (vin, descriptor) in entities:
             return
+
         state = coordinator.get_state(vin, descriptor)
         if state:
             if not isinstance(state.value, bool):
                 return
-        elif not assume_binary:
+        elif not assume_binary and not from_signal:
             return
+
         entity = CardataBinarySensor(coordinator, vin, descriptor)
         entities[(vin, descriptor)] = entity
         async_add_entities([entity])
 
-    entity_registry = er.async_get(hass)
-    for entity_entry in er.async_entries_for_config_entry(
-        entity_registry, entry.entry_id
-    ):
-        if entity_entry.domain != "binary_sensor":
+        # Re-populate tracking set for derived isMoving sensor so coordinator knows it exists
+        # This is critical after restart when tracking set is empty but entity is restored
+        if descriptor == "vehicle.isMoving":
+            coordinator._motion_detector.signal_entity_created(vin)
+
+    # Subscribe to signals FIRST to catch any descriptors arriving during setup
+    # This prevents race conditions where descriptors arrive between iter_descriptors
+    # and signal subscription
+    async def async_handle_new_binary_sensor(vin: str, descriptor: str) -> None:
+        ensure_entity(vin, descriptor, from_signal=True)
+
+    entry.async_on_unload(async_dispatcher_connect(hass, coordinator.signal_new_binary, async_handle_new_binary_sensor))
+
+    # Note: We don't subscribe to signal_update for entity creation here.
+    # - signal_new_binary handles new boolean descriptors
+    # - iter_descriptors() loop below handles existing data
+    # - Individual entities subscribe to signal_update for their own state updates
+    # This avoids duplicate processing on every update.
+
+    # Restore enabled binary sensors from entity registry
+    entity_registry = async_get(hass)
+
+    for entity_entry in async_entries_for_config_entry(entity_registry, entry.entry_id):
+        if entity_entry.domain != "binary_sensor" or entity_entry.disabled_by is not None:
             continue
-        if entity_entry.disabled_by is not None:
-            continue
+
         unique_id = entity_entry.unique_id
         if not unique_id or "_" not in unique_id:
             continue
+
         vin, descriptor = unique_id.split("_", 1)
         ensure_entity(vin, descriptor, assume_binary=True)
 
+    # Add binary sensors from coordinator state
     for vin, descriptor in coordinator.iter_descriptors(binary=True):
         ensure_entity(vin, descriptor)
-
-    async def async_handle_new(vin: str, descriptor: str) -> None:
-        ensure_entity(vin, descriptor)
-
-    entry.async_on_unload(
-        async_dispatcher_connect(hass, coordinator.signal_new_binary, async_handle_new)
-    )

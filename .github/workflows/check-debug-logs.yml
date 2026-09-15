@@ -1,0 +1,144 @@
+name: Check debug logs in bug reports
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  check-logs-issue:
+    if: >-
+      github.event_name == 'issues' &&
+      contains(github.event.issue.labels.*.name, 'bug')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Check for valid debug logs
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const body = context.payload.issue.body || '';
+
+            // Extract debug logs section (between ### Debug logs and next ###)
+            const match = body.match(/### Debug logs\s*\n([\s\S]*?)(?=\n### |$)/);
+            const logsSection = match ? match[1].trim() : '';
+
+            // A .log attachment anywhere in the body counts as valid evidence —
+            // mirrors the comment job's behaviour so reports that link the file
+            // instead of pasting it don't get falsely flagged.
+            const logAttachmentPattern = /github\.com\/user-attachments\/files\/\d+\/[^\s)]+\.log\b/i;
+            const hasLogAttachment = logAttachmentPattern.test(body);
+
+            // Must contain at least one DEBUG-level line in an actual log entry.
+            // WARNING/INFO-only logs are not debug logs, and the word DEBUG
+            // appearing in yaml snippets or instructions should not match.
+            const hasDebugLevel = /\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}.*\bDEBUG\b/.test(logsSection);
+
+            // Additional quality patterns
+            const logPatterns = [
+              /\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/,  // timestamp
+              /custom_components\.cardata/,                 // integration logger
+            ];
+
+            const hasLabel = context.payload.issue.labels.some(l => l.name === 'needs-debug-logs');
+            const matchCount = logPatterns.filter(p => p.test(logsSection)).length;
+            const isValid = hasLogAttachment || (logsSection.length > 100 && hasDebugLevel && matchCount >= 1);
+
+            if (!isValid) {
+              // Add label if not present
+              if (!hasLabel) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  labels: ['needs-debug-logs']
+                });
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: [
+                    '**The debug logs section does not appear to contain valid Home Assistant debug logs.**',
+                    '',
+                    'Please enable debug logging and paste the actual log output:',
+                    '',
+                    '```yaml',
+                    'logger:',
+                    '  default: info',
+                    '  logs:',
+                    '    custom_components.cardata: debug',
+                    '```',
+                    '',
+                    'Then reproduce the issue and paste the logs in the **Debug logs** field.',
+                    'Remove or redact personal data (VIN, location, tokens).',
+                    '',
+                    'This issue will remain labeled `needs-debug-logs` until valid logs are provided.',
+                  ].join('\n')
+                });
+              }
+            } else if (hasLabel) {
+              // Valid logs found and label exists — remove it
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  name: 'needs-debug-logs'
+                });
+              } catch (e) {
+                // Label might already be removed
+              }
+            }
+
+  check-logs-comment:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      !github.event.issue.pull_request &&
+      contains(github.event.issue.labels.*.name, 'needs-debug-logs')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Check comment for debug logs
+        uses: actions/github-script@v8
+        with:
+          script: |
+            // Fetch all comments on the issue
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              }
+            );
+
+            const logAttachmentPattern = /github\.com\/user-attachments\/files\/\d+\/[^\s)]+\.log\b/i;
+            const logPatterns = [
+              /\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/,  // timestamp
+              /custom_components\.cardata/,                 // integration logger
+            ];
+
+            const hasLogs = comments.some(c => {
+              const body = c.body || '';
+              if (logAttachmentPattern.test(body)) return true;
+              const hasDebugLevel = /\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}.*\bDEBUG\b/.test(body);
+              const matchCount = logPatterns.filter(p => p.test(body)).length;
+              return body.length > 100 && hasDebugLevel && matchCount >= 1;
+            });
+
+            if (hasLogs) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  name: 'needs-debug-logs'
+                });
+              } catch (e) {
+                // Label might already be removed
+              }
+            }

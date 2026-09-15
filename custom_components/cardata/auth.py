@@ -1,0 +1,646 @@
+# Copyright (c) 2025, Renaud Allard <renaud@allard.it>, Kris Van Biesen <kvanbiesen@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+"""Token refresh and reauth handling."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from contextlib import suppress
+from typing import Any
+
+import aiohttp
+from homeassistant.components import persistent_notification
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry
+from homeassistant.core import HomeAssistant
+
+from .const import (
+    DEFAULT_REFRESH_INTERVAL,
+    DOMAIN,
+    ERR_TOKEN_REFRESH_IN_PROGRESS,
+    HV_BATTERY_DESCRIPTORS,
+    LOCK_ACQUIRE_TIMEOUT,
+)
+from .container import CardataContainerManager
+from .device_flow import CardataAuthError, refresh_tokens
+from .runtime import CardataRuntimeData, async_update_entry_data
+from .stream import CardataStreamManager
+
+_LOGGER = logging.getLogger(__name__)
+
+# Refresh token if it expires within this many seconds
+TOKEN_EXPIRY_BUFFER_SECONDS = 300  # 5 minutes
+
+
+def is_token_expired(entry: ConfigEntry, buffer_seconds: int = TOKEN_EXPIRY_BUFFER_SECONDS) -> tuple[bool, int | None]:
+    """Check if the access token is expired or about to expire.
+
+    Args:
+        entry: Config entry containing token data
+        buffer_seconds: Consider token expired if it expires within this many seconds
+
+    Returns:
+        Tuple of (is_expired, seconds_until_expiry or None if unknown)
+    """
+    data = entry.data
+    expires_in = data.get("expires_in")
+    received_at = data.get("received_at")
+
+    # If we don't have expiry info, assume token might be expired
+    if expires_in is None or received_at is None:
+        _LOGGER.debug("Token expiry info not available, assuming refresh needed")
+        return True, None
+
+    try:
+        expires_in = int(expires_in)
+        received_at = float(received_at)
+    except (TypeError, ValueError):
+        _LOGGER.debug("Invalid token expiry data, assuming refresh needed")
+        return True, None
+
+    # Calculate when the token expires
+    expiry_time = received_at + expires_in
+    now = time.time()
+    seconds_until_expiry = int(expiry_time - now)
+
+    # Token is expired or will expire within buffer
+    if seconds_until_expiry <= buffer_seconds:
+        _LOGGER.debug(
+            "Token expires in %d seconds (buffer: %d), refresh needed",
+            seconds_until_expiry,
+            buffer_seconds,
+        )
+        return True, seconds_until_expiry
+
+    return False, seconds_until_expiry
+
+
+async def async_ensure_valid_token(
+    entry: ConfigEntry,
+    session: aiohttp.ClientSession,
+    manager: CardataStreamManager,
+    container_manager: CardataContainerManager | None = None,
+    buffer_seconds: int = TOKEN_EXPIRY_BUFFER_SECONDS,
+) -> bool:
+    """Ensure the access token is valid, refreshing if necessary.
+
+    This function checks token expiry proactively and only refreshes when needed,
+    avoiding unnecessary API calls and quota usage.
+
+    Args:
+        entry: Config entry
+        session: aiohttp session
+        manager: Stream manager
+        container_manager: Optional container manager
+        buffer_seconds: Refresh if token expires within this many seconds
+
+    Returns:
+        True if token is valid (or was successfully refreshed), False on failure
+    """
+    expired, seconds_left = is_token_expired(entry, buffer_seconds)
+
+    if not expired:
+        if seconds_left is not None:
+            _LOGGER.debug("Token still valid for %d seconds, skipping refresh", seconds_left)
+        return True
+
+    # Token is expired or about to expire, refresh it
+    _LOGGER.debug("Proactively refreshing token (expires in %s seconds)", seconds_left)
+    try:
+        await refresh_tokens_for_entry(entry, session, manager, container_manager)
+        _LOGGER.debug("Token refreshed successfully")
+        return True
+    except CardataAuthError as err:
+        _LOGGER.warning("Proactive token refresh failed: %s", err)
+        return False
+    except Exception as err:
+        _LOGGER.exception("Unexpected error during proactive token refresh: %s", err)
+        return False
+
+
+async def refresh_tokens_for_entry(
+    entry: ConfigEntry,
+    session: aiohttp.ClientSession,
+    manager: CardataStreamManager,
+    container_manager: CardataContainerManager | None = None,
+    buffer_seconds: int = TOKEN_EXPIRY_BUFFER_SECONDS,
+) -> None:
+    """Refresh tokens and update entry data.
+
+    CRITICAL: This function ONLY handles token refresh.
+    Container management is handled separately to avoid API hammering.
+    Creating containers during token refresh causes excessive API calls!
+    """
+    hass = manager.hass
+
+    # get runtime to access the token refresh lock
+    runtime: CardataRuntimeData | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+
+    # if runtime exists and has a lock, we"ll use it
+    if runtime and runtime.token_refresh_lock:
+        lock = runtime.token_refresh_lock
+
+        # Acquire lock with timeout
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=30.0)
+        except TimeoutError:
+            _LOGGER.debug("Token Refresh lock timeout for entry %s; another refresh in progress", entry.entry_id)
+            raise CardataAuthError(ERR_TOKEN_REFRESH_IN_PROGRESS) from None
+
+        # Lock is now acquired - use try/finally immediately to ensure release
+        try:
+            # double check if token still needs refresh
+            expired, seconds_left = is_token_expired(entry, buffer_seconds)
+            if not expired:
+                _LOGGER.debug("Token was refreshed by another caller; skipping (valid for %s seconds)", seconds_left)
+                return
+            await _do_token_refresh(entry, session, manager, container_manager, hass)
+        finally:
+            lock.release()
+    else:
+        # no lock available( should not happen but run as fallback )
+        _LOGGER.debug("No token refresh lock available; proceeding without lock")
+        await _do_token_refresh(entry, session, manager, container_manager, hass)
+
+
+async def _do_token_refresh(
+    entry: ConfigEntry,
+    session: aiohttp.ClientSession,
+    manager: CardataStreamManager,
+    container_manager: CardataContainerManager | None,
+    hass: HomeAssistant,
+) -> None:
+    """Internal function to perform the actual token refresh."""
+    data = dict(entry.data)
+    refresh_token = data.get("refresh_token")
+    client_id = data.get("client_id")
+
+    if not refresh_token or not client_id:
+        raise CardataAuthError("Missing credentials for refresh")
+
+    from .const import DEFAULT_SCOPE
+
+    requested_scope = data.get("scope") or DEFAULT_SCOPE
+
+    token_data = await refresh_tokens(
+        session,
+        client_id=client_id,
+        refresh_token=refresh_token,
+        scope=requested_scope,
+    )
+
+    new_id_token = token_data.get("id_token")
+    if not new_id_token:
+        raise CardataAuthError("Token refresh response did not include id_token")
+
+    new_access_token = token_data.get("access_token")
+    if not new_access_token:
+        raise CardataAuthError("Token refresh response did not include access_token")
+
+    token_updates = {
+        "access_token": new_access_token,
+        "refresh_token": token_data.get("refresh_token", refresh_token),
+        "id_token": new_id_token,
+        "expires_in": token_data.get("expires_in"),
+        "scope": token_data.get("scope", data.get("scope")),
+        "token_type": token_data.get("token_type", data.get("token_type")),
+        "received_at": time.time(),
+    }
+
+    # Sync existing container ID to manager (NO creation!)
+    if container_manager:
+        hv_container_id = data.get("hv_container_id")
+        if hv_container_id:
+            container_manager.sync_from_entry(hv_container_id)
+            _LOGGER.debug("Synced existing container %s to manager", hv_container_id)
+
+    await async_update_entry_data(hass, entry, token_updates)
+    # Update credentials in memory only — callers handle reconnection.
+    # Using set_credentials avoids acquiring _credential_lock and _connect_lock,
+    # which would deadlock when called from _async_reconnect (holds _connect_lock)
+    # or cause AB-BA deadlocks with refresh_loop vs _async_reconnect.
+    manager.set_credentials(
+        gcid=data.get("gcid"),
+        id_token=new_id_token,
+    )
+
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if runtime:
+        runtime.reauth_pending = False
+
+
+async def handle_stream_error(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    reason: str,
+) -> None:
+    """Handle stream connection errors, managing reauth flow."""
+    # Check if runtime data exists (entry might be unloading or not yet set up)
+    domain_data = hass.data.get(DOMAIN, {})
+    runtime: CardataRuntimeData | None = domain_data.get(entry.entry_id)
+    if runtime is None:
+        _LOGGER.debug(
+            "Cannot handle stream error for entry %s: runtime data not found (entry may be unloading)",
+            entry.entry_id,
+        )
+        return
+
+    notification_id = f"{DOMAIN}_reauth_{entry.entry_id}"
+
+    if reason == "unauthorized":
+        if runtime.reauth_in_progress:
+            _LOGGER.debug(
+                "Ignoring duplicate unauthorized notification for entry %s",
+                entry.entry_id,
+            )
+            return
+
+        # Prevent concurrent handling: refresh_tokens_for_entry yields to
+        # the event loop, which could allow a second call to enter before
+        # reauth_in_progress is set. The flag is cleared in the finally block.
+        if runtime._handling_unauthorized:
+            _LOGGER.debug(
+                "Unauthorized handling already in progress for entry %s",
+                entry.entry_id,
+            )
+            return
+        runtime._handling_unauthorized = True
+
+        try:
+            now = time.time()
+
+            if runtime.reauth_pending:
+                _LOGGER.debug(
+                    "Reauth pending for entry %s after failed refresh; starting flow",
+                    entry.entry_id,
+                )
+            elif now - runtime.last_refresh_attempt >= 30:
+                runtime.last_refresh_attempt = now
+                try:
+                    _LOGGER.debug("Attempting token refresh after auth failure")
+
+                    await refresh_tokens_for_entry(
+                        entry,
+                        runtime.session,
+                        runtime.stream,
+                        runtime.container_manager,
+                    )
+
+                    # Success! Reset the unauthorized flags
+                    if runtime and runtime.reauth_in_progress:
+                        runtime.unauthorized_protection.reset()
+
+                    runtime.reauth_in_progress = False
+                    runtime.last_reauth_attempt = 0.0
+                    runtime.reauth_pending = False
+                    _LOGGER.info("BMW credentials refreshed successfully after auth failure")
+
+                    # Reconnect MQTT with the new credentials
+                    try:
+                        await runtime.stream.async_start()
+                    except Exception as start_err:
+                        _LOGGER.warning("MQTT reconnect after credential refresh failed: %s", start_err)
+                    return
+
+                except (TimeoutError, CardataAuthError, aiohttp.ClientError) as err:
+                    # Check if this is just a concurrent refresh attempt (not a real failure)
+                    if ERR_TOKEN_REFRESH_IN_PROGRESS in str(err):
+                        _LOGGER.debug(
+                            "Token refresh skipped for entry %s: another refresh already in progress",
+                            entry.entry_id,
+                        )
+                        # Don't record as unauthorized attempt - the other refresh will handle it
+                        return
+                    _LOGGER.warning(
+                        "Token refresh after unauthorized failed for entry %s: %s",
+                        entry.entry_id,
+                        err,
+                    )
+                    if runtime and runtime.unauthorized_protection:
+                        runtime.unauthorized_protection.record_attempt()
+                        _LOGGER.debug("Token refresh failed, attempt recorded")
+            else:
+                runtime.reauth_pending = True
+                _LOGGER.debug(
+                    "Token refresh attempted recently for entry %s; will trigger reauth",
+                    entry.entry_id,
+                )
+
+            if now - runtime.last_reauth_attempt < 30:
+                _LOGGER.debug(
+                    "Recent reauth already attempted for entry %s; skipping new flow",
+                    entry.entry_id,
+                )
+                return
+
+            runtime.reauth_in_progress = True
+            runtime.last_reauth_attempt = now
+            runtime.reauth_pending = False
+            _LOGGER.warning("BMW stream unauthorized; starting reauth flow")
+
+            if runtime.reauth_flow_id:
+                with suppress(Exception):
+                    hass.config_entries.flow.async_abort(runtime.reauth_flow_id)
+                runtime.reauth_flow_id = None
+
+            persistent_notification.async_create(
+                hass,
+                "Authorization failed for BMW CarData. Please reauthorize the integration.",
+                title="Bmw Cardata",
+                notification_id=notification_id,
+            )
+
+            flow_result = await hass.config_entries.flow.async_init(
+                DOMAIN,
+                context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+                data={**entry.data, "entry_id": entry.entry_id},
+            )
+            if isinstance(flow_result, dict):
+                runtime.reauth_flow_id = flow_result.get("flow_id")
+        finally:
+            runtime._handling_unauthorized = False
+
+    elif reason == "recovered":
+        if runtime.reauth_in_progress:
+            runtime.reauth_in_progress = False
+            _LOGGER.debug("BMW stream connection restored; dismissing reauth notification")
+            persistent_notification.async_dismiss(hass, notification_id)
+            if runtime.reauth_flow_id:
+                with suppress(Exception):
+                    hass.config_entries.flow.async_abort(runtime.reauth_flow_id)
+                runtime.reauth_flow_id = None
+        runtime.reauth_pending = False
+        runtime.last_reauth_attempt = 0.0
+
+
+async def async_manual_refresh_tokens(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Manually refresh tokens (called by config_flow options)."""
+    runtime: CardataRuntimeData | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if runtime is None:
+        raise CardataAuthError("Integration runtime not ready")
+
+    await refresh_tokens_for_entry(
+        entry,
+        runtime.session,
+        runtime.stream,
+        runtime.container_manager,
+    )
+
+
+async def async_ensure_container_for_entry(
+    entry: ConfigEntry,
+    hass: HomeAssistant,
+    container_manager: CardataContainerManager | None,
+) -> bool:
+    """Ensure HV container exists for entry.
+
+    If a container with matching descriptors is already stored, reuses it.
+    Otherwise, deletes any stale containers and creates a fresh one.
+
+    This function should ONLY be called during bootstrap.
+    NOT during token refresh, MQTT reconnects, or unauthorized errors!
+
+    Returns True if container is ready, False otherwise.
+    """
+    from .const import DOMAIN
+    from .container import CardataContainerError
+
+    if container_manager is None:
+        _LOGGER.warning("Cannot ensure container - no container manager available")
+        return False
+
+    data = dict(entry.data)
+    hv_container_id = data.get("hv_container_id")
+    stored_signature = data.get("hv_descriptor_signature")
+    access_token = data.get("access_token")
+
+    if not access_token:
+        _LOGGER.warning("Cannot ensure container - no access token available")
+        return False
+
+    # Calculate desired signature
+    desired_signature = CardataContainerManager.compute_signature(HV_BATTERY_DESCRIPTORS)
+
+    # If container exists and signature matches, we're done!
+    if hv_container_id and stored_signature == desired_signature:
+        container_manager.sync_from_entry(hv_container_id)
+        _LOGGER.debug("Using existing container %s (signature matches)", hv_container_id)
+        return True
+
+    # Log reason for recreation
+    if hv_container_id and stored_signature != desired_signature:
+        _LOGGER.info(
+            "Container signature mismatch (stored: %s, expected: %s). Recreating container with updated descriptors.",
+            stored_signature,
+            desired_signature,
+        )
+    else:
+        _LOGGER.info("Creating HV container for entry %s (exists=%s)", entry.entry_id, hv_container_id is not None)
+
+    container_manager.sync_from_entry(None)
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    rate_limiter = runtime.container_rate_limiter if runtime else None
+
+    try:
+        # Reset deletes old matching containers before creating fresh one,
+        # ensuring updated descriptors are used (not loose-match reuse).
+        container_id = await container_manager.async_reset_hv_container(access_token, rate_limiter)
+    except CardataContainerError as err:
+        _LOGGER.error(
+            "Failed to create HV container for entry %s: %s",
+            entry.entry_id,
+            err,
+        )
+        return False
+
+    if not container_id:
+        _LOGGER.error("Container creation returned no ID")
+        return False
+
+    actual_signature = container_manager.container_signature or desired_signature
+
+    # Success! Update entry
+    container_manager.sync_from_entry(container_id)
+
+    # Sync to runtime if available
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if runtime and runtime.container_manager:
+        runtime.container_manager.sync_from_entry(container_id)
+
+    update_data: dict[str, Any] = {
+        "hv_container_id": container_id,
+        "hv_descriptor_signature": actual_signature,
+        "container_ids": [container_id],
+    }
+    await async_update_entry_data(hass, entry, update_data)
+    _LOGGER.info("Ensured HV container %s for entry %s", container_id, entry.entry_id)
+
+    return True
+
+
+async def async_token_refresh_loop(hass: HomeAssistant, entry_id: str) -> None:
+    """Periodically refresh tokens with exponential backoff on failure.
+
+    This runs as a long-lived background task for the lifetime of a config entry.
+    It reads runtime data from hass.data each iteration so it respects session
+    recreation and credential updates.
+    """
+    consecutive_auth_failures = 0
+    max_auth_failures = 3  # Trigger reauth after 3 consecutive auth failures
+    base_backoff = DEFAULT_REFRESH_INTERVAL
+    max_backoff = 4 * 60 * 60  # Cap at 4 hours
+
+    try:
+        while True:
+            # Calculate backoff: normal interval, or exponential if failing
+            if consecutive_auth_failures > 0:
+                # Exponential backoff: 45min -> 90min -> 180min (capped at 4h)
+                backoff = min(base_backoff * (2**consecutive_auth_failures), max_backoff)
+                _LOGGER.debug(
+                    "Token refresh backoff: %d seconds (failure %d/%d)",
+                    backoff,
+                    consecutive_auth_failures,
+                    max_auth_failures,
+                )
+            else:
+                backoff = base_backoff
+
+            await asyncio.sleep(backoff)
+
+            # Verify entry still exists after sleep
+            current_entry = hass.config_entries.async_get_entry(entry_id)
+            if current_entry is None:
+                _LOGGER.debug("Entry %s removed, stopping token refresh loop", entry_id)
+                return
+
+            # Verify runtime still valid
+            runtime: CardataRuntimeData | None = hass.data.get(DOMAIN, {}).get(entry_id)
+            if runtime is None:
+                _LOGGER.debug(
+                    "Runtime removed for entry %s, stopping token refresh loop",
+                    entry_id,
+                )
+                return
+
+            try:
+                # Use runtime.session (not a stale reference) so that
+                # session recreation via async_recreate_session is respected
+                current_session = runtime.session
+                # Snapshot old token to detect actual refresh
+                old_id_token = current_entry.data.get("id_token")
+                # Timeout prevents hanging indefinitely on network issues
+                await asyncio.wait_for(
+                    refresh_tokens_for_entry(
+                        current_entry,
+                        current_session,
+                        runtime.stream,
+                        runtime.container_manager,
+                        buffer_seconds=DEFAULT_REFRESH_INTERVAL,
+                    ),
+                    timeout=LOCK_ACQUIRE_TIMEOUT,
+                )
+                # Success - reset failure counters
+                if consecutive_auth_failures > 0:
+                    _LOGGER.info(
+                        "Token refresh succeeded after %d consecutive failures",
+                        consecutive_auth_failures,
+                    )
+                consecutive_auth_failures = 0
+                # Record session success for health tracking
+                runtime.record_session_success()
+
+                # Check if token was actually refreshed
+                refreshed_entry = hass.config_entries.async_get_entry(entry_id)
+                if refreshed_entry and refreshed_entry.data.get("id_token") != old_id_token:
+                    # Proactively reconnect MQTT with fresh credentials.
+                    # This prevents BMW from disconnecting us when the old
+                    # token expires (~1h), eliminating the hourly disconnect
+                    # /reconnect cycle.
+                    try:
+                        _LOGGER.debug("Reconnecting MQTT with refreshed credentials")
+                        await runtime.stream.async_stop()
+                        await runtime.stream.async_start()
+                    except Exception as err:
+                        _LOGGER.warning("Proactive MQTT reconnect after token refresh failed: %s", err)
+                        # async_stop succeeded but async_start failed — MQTT is dead.
+                        # Schedule a recovery attempt so the stream doesn't stay down
+                        # until the next token refresh cycle (~45 min).
+                        try:
+                            await asyncio.sleep(5)
+                            await runtime.stream.async_start()
+                        except Exception as retry_err:
+                            _LOGGER.error("MQTT recovery retry also failed: %s", retry_err)
+
+            except CardataAuthError as err:
+                # Check if this is just a concurrent refresh attempt (not a real failure)
+                if ERR_TOKEN_REFRESH_IN_PROGRESS in str(err):
+                    _LOGGER.debug("Token refresh skipped: another refresh already in progress")
+                    # Don't count as a failure - another refresh is handling it
+                    continue
+
+                consecutive_auth_failures += 1
+                _LOGGER.error(
+                    "Token refresh failed (%d/%d): %s",
+                    consecutive_auth_failures,
+                    max_auth_failures,
+                    err,
+                )
+
+                # After max failures, trigger reauth flow and stop retrying
+                if consecutive_auth_failures >= max_auth_failures:
+                    _LOGGER.error(
+                        "Token refresh failed %d consecutive times; triggering reauth flow",
+                        consecutive_auth_failures,
+                    )
+                    # Re-fetch entry in case it changed during token refresh
+                    reauth_entry = hass.config_entries.async_get_entry(entry_id)
+                    if reauth_entry:
+                        await handle_stream_error(hass, reauth_entry, "unauthorized")
+                    # Continue loop but with max backoff until reauth succeeds
+                    # The reauth flow will update credentials and reset state
+
+            except TimeoutError:
+                _LOGGER.warning("Token refresh timed out after 60 seconds")
+                # Timeout is transient - don't count as auth failure
+                # But track for session health
+                runtime = hass.data.get(DOMAIN, {}).get(entry_id)
+                if runtime and runtime.record_session_failure():
+                    await runtime.async_recreate_session()
+
+            except aiohttp.ClientError as err:
+                _LOGGER.warning("Token refresh network error: %s", err)
+                # Network errors may indicate unhealthy session
+                runtime = hass.data.get(DOMAIN, {}).get(entry_id)
+                if runtime and runtime.record_session_failure():
+                    await runtime.async_recreate_session()
+
+            except Exception as err:
+                _LOGGER.exception("Token refresh crashed with unexpected error: %s", err)
+                # Unknown errors - don't count as auth failure but log
+
+    except asyncio.CancelledError:
+        return

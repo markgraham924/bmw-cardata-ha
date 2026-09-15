@@ -1,6 +1,93 @@
+# Copyright (c) 2025, Renaud Allard <renaud@allard.it>, Kris Van Biesen <kvanbiesen@gmail.com>, Jyri Saukkonen <jyri.saukkonen+jjyksi@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
 """Constants for the BMW CarData integration."""
 
 DOMAIN = "cardata"
+
+# Individual descriptor constants (used across 3+ files)
+DESC_SOC_HEADER = "vehicle.drivetrain.batteryManagement.header"
+DESC_MAX_ENERGY = "vehicle.drivetrain.batteryManagement.maxEnergy"
+DESC_BATTERY_SIZE_MAX = "vehicle.drivetrain.batteryManagement.batterySizeMax"
+DESC_CHARGING_AC_VOLTAGE = "vehicle.drivetrain.electricEngine.charging.acVoltage"
+DESC_CHARGING_AC_AMPERE = "vehicle.drivetrain.electricEngine.charging.acAmpere"
+DESC_CHARGING_PHASES = "vehicle.drivetrain.electricEngine.charging.phaseNumber"
+DESC_CHARGING_STATUS = "vehicle.drivetrain.electricEngine.charging.status"
+DESC_CHARGING_LEVEL = "vehicle.drivetrain.electricEngine.charging.level"
+DESC_CHARGING_POWER = "vehicle.powertrain.electric.battery.charging.power"
+DESC_CHARGING_TIME_REMAINING = "vehicle.drivetrain.electricEngine.charging.timeRemaining"
+DESC_REMAINING_FUEL = "vehicle.drivetrain.fuelSystem.remainingFuel"
+DESC_FUEL_LEVEL = "vehicle.drivetrain.fuelSystem.level"
+DESC_TRAVELLED_DISTANCE = "vehicle.vehicle.travelledDistance"
+DESC_TRIP_HVSOC = "vehicle.trip.segment.end.drivetrain.batteryManagement.hvSoc"
+DESC_SOC_DISPLAYED = "vehicle.powertrain.electric.battery.stateOfCharge.displayed"
+
+# Charge port descriptors, used to tell one plug-in apart from the next
+DESC_CHARGING_PORT_STATUS = "vehicle.body.chargingPort.status"
+DESC_CHARGING_PORT_PLUGGED = "vehicle.powertrain.tractionBattery.charging.port.anyPosition.isPlugged"
+DESC_CHARGING_PORT_PLUG_EVENT = "vehicle.body.chargingPort.plugEventId"
+
+# Lock acquisition timeout (seconds) — used for connect, credential, and token refresh locks
+LOCK_ACQUIRE_TIMEOUT = 60.0
+
+# Location descriptors
+LOCATION_LATITUDE_DESCRIPTOR = "vehicle.cabin.infotainment.navigation.currentLocation.latitude"
+LOCATION_LONGITUDE_DESCRIPTOR = "vehicle.cabin.infotainment.navigation.currentLocation.longitude"
+LOCATION_HEADING_DESCRIPTOR = "vehicle.cabin.infotainment.navigation.currentLocation.heading"
+LOCATION_ALTITUDE_DESCRIPTOR = "vehicle.cabin.infotainment.navigation.currentLocation.altitude"
+
+# Window descriptors for sensor icons
+WINDOW_DESCRIPTORS = (
+    "vehicle.cabin.window.row1.driver.status",
+    "vehicle.cabin.window.row1.passenger.status",
+    "vehicle.cabin.window.row2.driver.status",
+    "vehicle.cabin.window.row2.passenger.status",
+    "vehicle.body.trunk.window.isOpen",
+)
+
+# Battery descriptors for device class detection
+BATTERY_DESCRIPTORS = {
+    DESC_SOC_HEADER,
+    DESC_SOC_DISPLAYED,
+    DESC_CHARGING_LEVEL,
+    "vehicle.powertrain.electric.battery.stateOfCharge.target",
+    DESC_TRIP_HVSOC,
+}
+
+# Predicted SOC sensor (calculated during charging)
+PREDICTED_SOC_DESCRIPTOR = "vehicle.predicted_soc"
+
+# Magic SOC sensor (driving consumption prediction)
+MAGIC_SOC_DESCRIPTOR = "vehicle.magic_soc"
+
+# Manual battery capacity (user input, takes priority over automatic detection)
+MANUAL_CAPACITY_DESCRIPTOR = "vehicle.manual_battery_capacity"
+
+# Manual tank capacity (user input, for computing fuel level percentage)
+MANUAL_TANK_CAPACITY_DESCRIPTOR = "vehicle.manual_tank_capacity"
+
 DEFAULT_SCOPE = "authenticate_user openid cardata:api:read cardata:streaming:read"
 DEVICE_CODE_URL = "https://customer.bmwgroup.com/gcdm/oauth/device/code"
 TOKEN_URL = "https://customer.bmwgroup.com/gcdm/oauth/token"
@@ -9,213 +96,239 @@ API_VERSION = "v1"
 BASIC_DATA_ENDPOINT = "/customers/vehicles/{vin}/basicData"
 DEFAULT_STREAM_HOST = "customer.streaming-cardata.bmwgroup.com"
 DEFAULT_STREAM_PORT = 9000
-DEFAULT_REFRESH_INTERVAL = 45 * 60  #How often to refresh the auth tokens in seconds
+# How often to refresh the auth tokens in seconds
+DEFAULT_REFRESH_INTERVAL = 45 * 60
 MQTT_KEEPALIVE = 30
-DEBUG_LOG = True
-DIAGNOSTIC_LOG_INTERVAL = 30 # How often we print stream logs in seconds
+DEBUG_LOG = False
+DIAGNOSTIC_LOG_INTERVAL = 30  # How often we print stream logs in seconds
 BOOTSTRAP_COMPLETE = "bootstrap_complete"
-REQUEST_LOG = "request_log"
-REQUEST_LOG_VERSION = 1
-REQUEST_LIMIT = 50 # API Quota
-REQUEST_WINDOW_SECONDS = 24 * 60 * 60 # How long API Quota is reserved after API Call in seconds
-TELEMATIC_POLL_INTERVAL = 40 * 60 # How often to call the Telematic API in seconds
+# Telematic polling budget — target ~24 scheduled API polls/day, leaving headroom
+# for bootstrap, trip-end events, etc. within BMW's 50-call daily quota.
+# When daily optional features (charging history, tyre diagnosis) are enabled,
+# the polling budget is reduced to keep total calls constant.
+TARGET_DAILY_POLLS = 24
+HTTP_TIMEOUT = 30  # Timeout for HTTP API requests in seconds
+DEFAULT_TRIP_POLL_COOLDOWN_MINUTES = 10  # Default cooldown between trip-end polls
+# How long to wait after a charge starts before asking the API for the phase
+# count, when the vehicle did not report one.  The poll is answered from BMW's
+# own snapshot of the vehicle, which lags the transition by a few seconds; one
+# that overtook it would write the state from before the charge over the live
+# one and end the session that just started.
+PHASE_POLL_DELAY_SECONDS = 60
+# Least time between two phase count polls for the same vehicle. The poll is
+# asked for once per charge that starts without a count, so this only matters to
+# a wallbox that starts and stops on solar surplus: without it, such a wallbox
+# would spend the daily quota one short charge at a time.
+PHASE_POLL_COOLDOWN_SECONDS = 3600
+# Least time between two polls asking whether a charge that ought to be over
+# has in fact ended. One is asked for per charge, so this only matters to a
+# wallbox that starts and stops on solar surplus.
+CHARGE_END_POLL_COOLDOWN_SECONDS = 3600
+# How far ahead of the charging status a phase count may be stamped and still
+# describe that charge. Descriptors from one event can carry timestamps a moment
+# apart, and a count judged stale costs an API poll that asks BMW what the
+# vehicle already said. Only counts above one get the lead: the reset BMW leaves
+# at the end of a charge is always one phase, so nothing reading higher can be
+# that reset, whatever its timestamp.
+PHASE_COUNT_LEAD_SECONDS = 10
 VEHICLE_METADATA = "vehicle_metadata"
 OPTION_MQTT_KEEPALIVE = "mqtt_keepalive"
 OPTION_DEBUG_LOG = "debug_log"
-OPTION_DIAGNOSTIC_INTERVAL = "diagnostic_log_interval"
 
-HV_BATTERY_CONTAINER_NAME = "BimmerData Vehicle Telemetry"
-HV_BATTERY_CONTAINER_PURPOSE = "Vehicle telemetry for Home Assistant"
+# Custom MQTT broker options
+OPTION_CUSTOM_MQTT_ENABLED = "custom_mqtt_enabled"
+OPTION_CUSTOM_MQTT_HOST = "custom_mqtt_host"
+OPTION_CUSTOM_MQTT_PORT = "custom_mqtt_port"
+OPTION_CUSTOM_MQTT_USERNAME = "custom_mqtt_username"
+OPTION_CUSTOM_MQTT_PASSWORD = "custom_mqtt_password"
+OPTION_CUSTOM_MQTT_TLS = "custom_mqtt_tls"  # "off", "tls", "tls_insecure"
+OPTION_CUSTOM_MQTT_TOPIC_PREFIX = "custom_mqtt_topic_prefix"
+DEFAULT_CUSTOM_MQTT_PORT = 1883
+DEFAULT_CUSTOM_MQTT_TOPIC_PREFIX = "bmw/"
+OPTION_DIAGNOSTIC_INTERVAL = "diagnostic_log_interval"
+OPTION_ENABLE_MAGIC_SOC = "enable_magic_soc"
+OPTION_ENABLE_CHARGING_HISTORY = "enable_charging_history"
+OPTION_ENABLE_TYRE_DIAGNOSIS = "enable_tyre_diagnosis"
+OPTION_ENABLE_TRIP_POLL = "enable_trip_end_polling"
+OPTION_TRIP_POLL_COOLDOWN = "trip_poll_cooldown_minutes"
+OPTION_ENABLE_EXTERNAL_POWER = "enable_external_power_injection"
+
+# Freshness window for externally injected charging power. While a local
+# injection has arrived within this many seconds, BMW-sourced V×A and
+# charging.power updates are suppressed so they do not overwrite the user's
+# meter data with stale BMW values.
+LOCAL_POWER_TTL_SECONDS = 120
+
+# Error message constants (for consistent error detection)
+ERR_TOKEN_REFRESH_IN_PROGRESS = "Token refresh already in progress"
+
+# Container Management
+# If True, search for existing containers to reuse (prevents accumulation)
+CONTAINER_REUSE_EXISTING = True
+# If False, always create new container (saves 1 API call but may accumulate containers)
+# Set to False for testing if you frequently change descriptors
+
+HV_BATTERY_CONTAINER_NAME = "BMW CarData HV Battery"
+HV_BATTERY_CONTAINER_PURPOSE = "High voltage battery telemetry"
 HV_BATTERY_DESCRIPTORS = [
-    # Vehicle identity and device metadata
-    "vehicle.vehicleIdentification.basicVehicleData",
-    "vehicle.vehicle.travelledDistance",
-    "vehicle.vehicle.avgSpeed",
-    "vehicle.vehicle.deepSleepModeActive",
-    "vehicle.vehicle.timeSetting",
-    "vehicle.isMoving",
-    "vehicle.drivetrain.engine.isActive",
-    "vehicle.drivetrain.engine.isIgnitionOn",
-    "vehicle.channel.ngtp.timeVehicle",
-    "vehicle.cabin.infotainment.isMobilePhoneConnected",
-    "vehicle.cabin.infotainment.displayUnit.distance",
-    "vehicle.cabin.infotainment.hmi.distanceUnit",
-    # Device tracker / GPS
-    "vehicle.cabin.infotainment.navigation.currentLocation.latitude",
-    "vehicle.cabin.infotainment.navigation.currentLocation.longitude",
-    "vehicle.cabin.infotainment.navigation.currentLocation.heading",
-    "vehicle.cabin.infotainment.navigation.currentLocation.altitude",
-    "vehicle.cabin.infotainment.navigation.currentLocation.fixStatus",
-    "vehicle.cabin.infotainment.navigation.currentLocation.numberOfSatellites",
-    "vehicle.cabin.infotainment.navigation.destinationSet.latitude",
-    "vehicle.cabin.infotainment.navigation.destinationSet.longitude",
-    "vehicle.cabin.infotainment.navigation.destinationSet.arrivalTime",
-    "vehicle.cabin.infotainment.navigation.remainingRange",
-    "vehicle.cabin.infotainment.navigation.pointsOfInterests.max",
-    # Closures, locks and access points
-    "vehicle.cabin.door.lock.status",
-    "vehicle.cabin.door.status",
-    "vehicle.cabin.door.row1.driver.isOpen",
-    "vehicle.cabin.door.row1.driver.position",
-    "vehicle.cabin.door.row1.passenger.isOpen",
-    "vehicle.cabin.door.row1.passenger.position",
-    "vehicle.cabin.door.row2.driver.isOpen",
-    "vehicle.cabin.door.row2.driver.position",
-    "vehicle.cabin.door.row2.passenger.isOpen",
-    "vehicle.cabin.door.row2.passenger.position",
-    "vehicle.cabin.window.row1.driver.status",
-    "vehicle.cabin.window.row1.passenger.status",
-    "vehicle.cabin.window.row2.driver.status",
-    "vehicle.cabin.window.row2.passenger.status",
-    "vehicle.body.hood.isOpen",
-    "vehicle.body.trunk.door.isOpen",
-    "vehicle.body.trunk.isOpen",
-    "vehicle.body.trunk.isLocked",
-    "vehicle.body.trunk.left.door.isOpen",
-    "vehicle.body.trunk.lower.door.isOpen",
-    "vehicle.body.trunk.right.door.isOpen",
-    "vehicle.body.trunk.upper.door.isOpen",
-    "vehicle.body.trunk.window.isOpen",
-    "vehicle.cabin.sunroof.status",
-    "vehicle.cabin.sunroof.overallStatus",
-    "vehicle.cabin.sunroof.tiltStatus",
-    # Lighting and alarms
-    "vehicle.body.lights.isRunningOn",
-    "vehicle.vehicle.antiTheftAlarmSystem.alarm.isOn",
-    "vehicle.vehicle.antiTheftAlarmSystem.alarm.armStatus",
-    # Range and energy
-    "vehicle.drivetrain.lastRemainingRange",
-    "vehicle.drivetrain.totalRemainingRange",
-    "vehicle.drivetrain.electricEngine.remainingElectricRange",
-    "vehicle.drivetrain.electricEngine.kombiRemainingElectricRange",
-    "vehicle.drivetrain.fuelSystem.level",
-    "vehicle.drivetrain.fuelSystem.remainingFuel",
-    "vehicle.electricalSystem.battery.voltage",
-    "vehicle.electricalSystem.battery.stateOfCharge",
-    "vehicle.electricalSystem.battery.stateOfChargePlausibility",
-    "vehicle.electricalSystem.battery.serviceDemand.replace",
-    "vehicle.electricalSystem.battery.serviceDemand.recharge",
     # Current high-voltage battery state of charge
-    "vehicle.drivetrain.batteryManagement.header",
-    "vehicle.drivetrain.electricEngine.charging.acAmpere",
-    "vehicle.drivetrain.electricEngine.charging.acVoltage",
+    DESC_SOC_HEADER,
+    DESC_CHARGING_AC_AMPERE,
+    DESC_CHARGING_AC_VOLTAGE,
     "vehicle.powertrain.electric.battery.preconditioning.automaticMode.statusFeedback",
     "vehicle.vehicle.avgAuxPower",
     "vehicle.powertrain.tractionBattery.charging.port.anyPosition.flap.isOpen",
-    "vehicle.powertrain.tractionBattery.charging.port.anyPosition.isPlugged",
+    DESC_CHARGING_PORT_PLUGGED,
     "vehicle.drivetrain.electricEngine.charging.timeToFullyCharged",
     "vehicle.powertrain.electric.battery.charging.acLimit.selected",
     "vehicle.drivetrain.electricEngine.charging.method",
     "vehicle.drivetrain.electricEngine.charging.profile.mode",
-    "vehicle.drivetrain.electricEngine.charging.profile.preference",
-    "vehicle.drivetrain.electricEngine.charging.profile.timerType",
-    "vehicle.drivetrain.electricEngine.charging.windowSelection",
-    "vehicle.drivetrain.electricEngine.charging.isImmediateChargingSystemReason",
-    "vehicle.drivetrain.electricEngine.charging.isSingleImmediateCharging",
-    "vehicle.drivetrain.electricEngine.charging.hvpmFinishReason",
-    "vehicle.body.chargingPort.plugEventId",
-    "vehicle.body.chargingPort.combinedStatus",
-    "vehicle.body.chargingPort.statusClearText",
-    "vehicle.body.chargingPort.isoSessionId",
-    "vehicle.body.chargingPort.isHospitalityActive",
-    "vehicle.drivetrain.electricEngine.charging.phaseNumber",
-    "vehicle.trip.segment.end.drivetrain.batteryManagement.hvSoc",
+    DESC_CHARGING_PORT_PLUG_EVENT,
+    DESC_CHARGING_PHASES,
+    DESC_TRIP_HVSOC,
     "vehicle.trip.segment.accumulated.drivetrain.electricEngine.recuperationTotal",
     "vehicle.drivetrain.electricEngine.remainingElectricRange",
-    "vehicle.drivetrain.electricEngine.charging.timeRemaining",
+    DESC_CHARGING_TIME_REMAINING,
     "vehicle.drivetrain.electricEngine.charging.hvStatus",
     "vehicle.drivetrain.electricEngine.charging.lastChargingReason",
     "vehicle.drivetrain.electricEngine.charging.lastChargingResult",
     "vehicle.powertrain.electric.battery.preconditioning.manualMode.statusFeedback",
     "vehicle.drivetrain.electricEngine.charging.reasonChargingEnd",
     "vehicle.powertrain.electric.battery.stateOfCharge.target",
-    "vehicle.powertrain.electric.battery.charging.acLimit.isActive",
-    "vehicle.powertrain.electric.battery.charging.acLimit.max",
-    "vehicle.powertrain.electric.battery.charging.acLimit.min",
-    "vehicle.powertrain.electric.battery.charging.acousticLimit",
+    DESC_SOC_DISPLAYED,
     "vehicle.body.chargingPort.lockedStatus",
-    "vehicle.body.flap.isLocked",
-    "vehicle.body.flap.isPermanentlyUnlocked",
-    "vehicle.drivetrain.electricEngine.charging.level",
+    DESC_CHARGING_LEVEL,
     "vehicle.powertrain.electric.battery.stateOfHealth.displayed",
-    "vehicle.drivetrain.batteryManagement.batterySizeMax",
-    "vehicle.drivetrain.batteryManagement.maxEnergy",
-    "vehicle.powertrain.electric.battery.charging.power",
-    "vehicle.drivetrain.electricEngine.charging.status",
-    "vehicle.drivetrain.electricEngine.charging.consumptionOverLifeTime.overall.gridEnergy",
-    "vehicle.drivetrain.electricEngine.charging.consumptionOverLifeTime.engineOn.gridEnergy",
-    "vehicle.drivetrain.electricEngine.charging.consumptionOverLifeTime.engineOff.gridEnergy",
-    "vehicle.drivetrain.electricEngine.charging.consumptionOverLifeTime.overall.referenceDistance",
-    "vehicle.drivetrain.electricEngine.charging.consumptionOverLifeTime.engineOn.referenceDistance",
-    "vehicle.drivetrain.electricEngine.charging.consumptionOverLifeTime.engineOff.referenceDistance",
-    "vehicle.drivetrain.fuelSystem.consumptionOverLifeTime.overall.fuel",
-    "vehicle.drivetrain.fuelSystem.consumptionOverLifeTime.overall.referenceDistance",
-    "vehicle.drivetrain.fuelSystem.consumptionOverLifeTime.inChargeIncreasing.fuel",
-    "vehicle.drivetrain.fuelSystem.consumptionOverLifeTime.inChargeIncreasing.referenceDistance",
-    "vehicle.drivetrain.fuelSystem.consumptionOverLifeTime.inChargeDepleting.fuel",
-    "vehicle.drivetrain.fuelSystem.consumptionOverLifeTime.inChargeDepleting.referenceDistanceEngineOn",
-    "vehicle.drivetrain.fuelSystem.consumptionOverLifeTime.inChargeDepleting.referenceDistanceEngineOff",
-    # HVAC / preconditioning
-    "vehicle.vehicle.preConditioning.activity",
-    "vehicle.vehicle.preConditioning.remainingTime",
-    "vehicle.vehicle.preConditioning.error",
-    "vehicle.vehicle.preConditioning.isRemoteEngineRunning",
-    "vehicle.cabin.hvac.preconditioning.status.progress",
-    "vehicle.cabin.hvac.preconditioning.status.remainingRunningTime",
-    "vehicle.cabin.hvac.preconditioning.status.rearDefrostActive",
-    "vehicle.cabin.hvac.preconditioning.configuration.defaultSettings.targetTemperature",
-    "vehicle.cabin.hvac.preconditioning.configuration.directStartSettings.targetTemperature",
-    "vehicle.cabin.hvac.preconditioning.configuration.isRemoteEngineStartDisclaimer",
-    "vehicle.cabin.steeringWheel.heating",
-    "vehicle.cabin.hvac.preconditioning.configuration.defaultSettings.steeringWheel.heating",
-    "vehicle.cabin.hvac.preconditioning.configuration.directStartSettings.steeringWheel.heating",
-    "vehicle.cabin.climate.timers.overwriteTimer.action",
-    "vehicle.cabin.climate.timers.overwriteTimer.hour",
-    "vehicle.cabin.climate.timers.overwriteTimer.minute",
-    "vehicle.cabin.climate.timers.weekdaysTimer1.action",
-    "vehicle.cabin.climate.timers.weekdaysTimer1.hour",
-    "vehicle.cabin.climate.timers.weekdaysTimer1.minute",
-    "vehicle.cabin.climate.timers.weekdaysTimer2.action",
-    "vehicle.cabin.climate.timers.weekdaysTimer2.hour",
-    "vehicle.cabin.climate.timers.weekdaysTimer2.minute",
-    # Trip summary
-    "vehicle.trip.segment.end.time",
-    "vehicle.trip.segment.end.travelledDistance",
-    "vehicle.trip.segment.accumulated.acceleration.starsAverage",
-    "vehicle.trip.segment.accumulated.chassis.brake.starsAverage",
-    "vehicle.trip.segment.accumulated.drivetrain.electricEngine.energyConsumptionComfort",
-    "vehicle.trip.segment.accumulated.drivetrain.transmission.setting.fractionDriveElectric",
-    "vehicle.trip.segment.accumulated.drivetrain.transmission.setting.fractionDriveEcoPro",
-    # Service / tyres
-    "vehicle.chassis.axle.wheel.tire.diagnosis",
-    "vehicle.chassis.axle.row1.wheel.left.tire.temperature",
-    "vehicle.chassis.axle.row1.wheel.right.tire.temperature",
-    "vehicle.chassis.axle.row2.wheel.left.tire.temperature",
-    "vehicle.chassis.axle.row2.wheel.right.tire.temperature",
-    "vehicle.status.checkControlMessages",
-    "vehicle.status.conditionBasedServices",
-    "vehicle.status.conditionBasedServicesCount",
-    "vehicle.status.conditionBasedServicesAverageDistancePerDay",
-    "vehicle.status.serviceDistance.next",
-    "vehicle.status.serviceDistance.yellow",
-    "vehicle.status.serviceTime.inspectionDateLegal",
-    "vehicle.status.serviceTime.yellow",
-    "vehicle.status.serviceTime.hUandAuServiceYellow",
-    "vehicle.channel.teleservice.status",
-    "vehicle.channel.teleservice.lastAutomaticServiceCallTime",
-    "vehicle.channel.teleservice.lastTeleserviceReportTime",
-    "vehicle.channel.teleservice.lastBreakdownCallTime",
-    "vehicle.channel.teleservice.lastManualCallTime",
-    "vehicle.electronicControlUnit.diagnosticTroubleCodes.raw",
-    "vehicle.serviceDemand.defect.id",
-    "vehicle.sevice.preferredSevicePartner",
+    "vehicle.vehicleIdentification.basicVehicleData",
+    DESC_BATTERY_SIZE_MAX,
+    DESC_MAX_ENERGY,
+    DESC_CHARGING_POWER,
+    DESC_CHARGING_STATUS,
+    # API fallback for vehicles where MQTT goes silent on the odometer
+    # descriptor (issue #377). Mileage previously only arrived via MQTT.
+    DESC_TRAVELLED_DISTANCE,
+    # Fuel/tank descriptors so conventional and hybrid vehicles (driveTrain
+    # CONV/PHEV) also get an API fallback, not just BEV battery data.
+    # Without these, BMW never returns fuel data via telematicData polling
+    # since the request is scoped to this container's descriptor list.
+    DESC_FUEL_LEVEL,
+    DESC_REMAINING_FUEL,
 ]
 
-#fetch_vehicle_mapping returns data like this:
-#2025-09-29 18:11:26.340 INFO (MainThread) [custom_components.cardata] Cardata vehicle mappings: [{'mappedSince': '2025-03-27T17:48:41.435Z', 'mappingType': 'PRIMARY', 'vin': 'WBY31AW090FP15359'}, {'mappedSince': '2023-10-10T13:29:38.484Z', 'mappingType': 'PRIMARY', 'vin': 'WBY1Z21020V791850'}]
+# Minimum number of telemetry descriptors required to consider a vehicle as "real"
+# Vehicles with fewer descriptors are likely "ghost" cars from family sharing with limited access
+MIN_TELEMETRY_DESCRIPTORS = 5
 
-#telematic reqeusts returns data like this:
-#2025-09-29 19:48:19.076 INFO (MainThread) [custom_components.cardata] Cardata telematic data for WBY31AW090FP15359: {'telematicData': {'vehicle.powertrain.electric.battery.preconditioning.manualMode.statusFeedback': {'timestamp': None, 'unit': None, 'value': None}, 'vehicle.powertrain.tractionBattery.charging.port.anyPosition.isPlugged': {'timestamp': None, 'unit': None, 'value': None}, 'vehicle.powertrain.electric.battery.stateOfHealth.displayed': {'timestamp': None, 'unit': None, 'value': None}, 'vehicle.drivetrain.electricEngine.remainingElectricRange': {'timestamp': '2025-09-29T16:48:19.019Z', 'unit': 'km', 'value': '286'}, 'vehicle.powertrain.electric.battery.stateOfCharge.target': {'timestamp': '2025-09-29T13:21:16.000Z', 'unit': '%', 'value': '85'}, 'vehicle.trip.segment.end.drivetrain.batteryManagement.hvSoc': {'timestamp': '2025-09-29T12:15:55.055Z', 'unit': '%', 'value': '74'}, 'vehicle.drivetrain.electricEngine.charging.lastChargingResult': {'timestamp': '2025-09-29T16:48:19.019Z', 'unit': None, 'value': 'FAILED'}, 'vehicle.powertrain.electric.battery.charging.acLimit.selected': {'timestamp': '2025-09-29T13:21:16.000Z', 'unit': 'A', 'value': '8'}, 'vehicle.drivetrain.electricEngine.charging.phaseNumber': {'timestamp': None, 'unit': None, 'value': None}, 'vehicle.drivetrain.batteryManagement.batterySizeMax': {'timestamp': '2025-09-29T13:21:16.000Z', 'unit': 'kWh', 'value': '0'}, 'vehicle.drivetrain.electricEngine.charging.method': {'timestamp': '2025-09-29T13:21:16.000Z', 'unit': None, 'value': 'NOCHARGING'}, 'vehicle.body.chargingPort.lockedStatus': {'timestamp': '2025-09-29T13:21:16.000Z', 'unit': None, 'value': 'CHARGING_CABLE_NOT_LOCKED'}, 'vehicle.powertrain.tractionBattery.charging.port.anyPosition.flap.isOpen': {'timestamp': None, 'unit': None, 'value': None}, 'vehicle.vehicle.avgAuxPower': {'timestamp': '2025-09-29T13:21:16.000Z', 'unit': 'kW', 'value': '0.5'}, 'vehicle.body.chargingPort.plugEventId': {'timestamp': '2025-09-29T13:21:16.000Z', 'unit': None, 'value': '1133'}, 'vehicle.drivetrain.electricEngine.charging.timeToFullyCharged': {'timestamp': None, 'unit': 'min', 'value': None}, 'vehicle.drivetrain.electricEngine.charging.lastChargingReason': {'timestamp': '2025-09-29T16:48:19.019Z', 'unit': None, 'value': 'INVALID'}, 'vehicle.trip.segment.accumulated.drivetrain.electricEngine.recuperationTotal': {'timestamp': None, 'unit': None, 'value': None}, 'vehicle.drivetrain.electricEngine.charging.hvStatus': {'timestamp': '2025-09-29T16:48:19.019Z', 'unit': None, 'value': 'NOT_CHARGING'}, 'vehicle.drivetrain.electricEngine.charging.reasonChargingEnd': {'timestamp': None, 'unit': None, 'value': None}, 'vehicle.drivetrain.electricEngine.charging.acVoltage': {'timestamp': None, 'unit': 'V', 'value': None}, 'vehicle.drivetrain.electricEngine.charging.acAmpere': {'timestamp': None, 'unit': 'A', 'value': None}, 'vehicle.drivetrain.electricEngine.charging.level': {'timestamp': '2025-09-29T16:48:19.019Z', 'unit': '%', 'value': '74'}, 'vehicle.powertrain.electric.battery.preconditioning.automaticMode.statusFeedback': {'timestamp': None, 'unit': None, 'value': None}, 'vehicle.drivetrain.electricEngine.charging.timeRemaining': {'timestamp': None, 'unit': 'min', 'value': None}, 'vehicle.drivetrain.batteryManagement.header': {'timestamp': '2025-09-29T13:21:16.000Z', 'unit': '%', 'value': '74'}, 'vehicle.vehicleIdentification.basicVehicleData': {'timestamp': None, 'unit': None, 'value': None}}}
+# SOC Learning parameters
+# Default DC charging efficiency (used before learning)
+DEFAULT_DC_EFFICIENCY = 0.93
+# Learning rate for Exponential Moving Average (0.2 = 20% new, 80% old)
+LEARNING_RATE = 0.2
+# Minimum SOC gain required to learn from a session (percentage)
+MIN_LEARNING_SOC_GAIN = 5.0
+# Share of a session's energy that may have been integrated under a phase count
+# the session later corrected, before its efficiency stops being worth learning
+# from.  A count arriving a minute into a three hour charge misattributes almost
+# nothing and should not cost the session.
+MAX_MISATTRIBUTED_ENERGY_SHARE = 0.05
+# Valid efficiency bounds - reject outliers outside this range
+MIN_VALID_EFFICIENCY = 0.40
+MAX_VALID_EFFICIENCY = 0.98
+# Tolerance for matching target SOC (percentage) - if within this, finalize immediately
+TARGET_SOC_TOLERANCE = 2.0
+# Grace period for BMW SOC update after charge ends (minutes)
+DC_SESSION_FINALIZE_MINUTES = 5.0
+AC_SESSION_FINALIZE_MINUTES = 15.0
+# Storage key and version for learned efficiency data
+SOC_LEARNING_STORAGE_KEY = "cardata.soc_learning"
+SOC_LEARNING_STORAGE_VERSION = 2
+# Maximum gap between energy readings before skipping integration (seconds)
+MAX_ENERGY_GAP_SECONDS = 600
 
-#vehicle basic data response:
-#2025-09-29 20:05:01.272 INFO (MainThread) [custom_components.cardata] Cardata basic data for WBY31AW090FP15359: {'bodyType': 'Coupe', 'brand': 'BMW', 'chargingModes': ['AC_LOW'], 'colourCodeRaw': 'C57', 'colourDescription': 'AVENTURINROT III METALLIC', 'constructionDate': '2022-11-24T00:00:00.000+0000', 'countryCode': 'FI', 'driveTrain': 'BEV', 'engine': 'XE2', 'fullSAList': '02PA,02VF,08TR,01CB,0487,0230,02VB,0420,0754,0775,0403,0654,06AF,02NH,02VL,0428,04V1,0322,08TF,04AW,04T2,04UR,08R9,06NX,0430,0493,06U3,08WQ,0688,0459,03AC,0854,01CX,04U9,0491,05AZ,0548,0715,02VC,04LN,05DN,06AE,05AC,04T3,0534,0881,0302,06C4,05AQ,0494,05AU,0431,0760,03FP,07M9,08WH,06AK,06VB,05DA', 'hasNavi': True, 'hasSunRoof': True, 'headUnit': 'HU_MGU', 'modelKey': '31AW', 'modelName': 'i4 M50', 'numberOfDoors': 5, 'propulsionType': 'EL', 'series': '4', 'seriesDevt': 'G26', 'simStatus': 'ACTIVE', 'steering': 'LL'}
+# Driving consumption learning parameters
+DEFAULT_CONSUMPTION_KWH_PER_KM = 0.21  # BMW BEV fleet average
+MIN_VALID_CONSUMPTION = 0.10
+MAX_VALID_CONSUMPTION = 0.40
+MIN_LEARNING_TRIP_DISTANCE_KM = 5.0
+MIN_LEARNING_SOC_DROP = 2.0
+DRIVING_SOC_CONTINUITY_SECONDS = 300  # 5 min window for isMoving flap tolerance
+DRIVING_SESSION_MAX_AGE_SECONDS = 4 * 60 * 60  # 4 hours
+GPS_MAX_STEP_DISTANCE_M = 2000  # Max single GPS step (m) — reject jumps after tunnel/lost signal
+REFERENCE_LEARNING_TRIP_KM = 30.0  # Reference distance for weighting learning: short trips contribute less
+
+# Model-to-consumption mapping (kWh/km, real-world averages)
+# Keys matched by prefix against modelName/series, longest match first
+DEFAULT_CONSUMPTION_BY_MODEL: dict[str, float] = {
+    # iX1 family (WLTP ~15.4-18.1)
+    "iX1 xDrive30": 0.18,
+    "iX1": 0.17,
+    # iX2 family (WLTP ~15.6-17.7)
+    "iX2 xDrive30": 0.18,
+    "iX2": 0.17,
+    # iX3 NK/NA5 (WLTP ~17.5-19.5)
+    "iX3 50 xDrive": 0.19,
+    # iX3 (old G08: WLTP ~18.5-18.9)
+    "iX3": 0.20,
+    # iX family (WLTP ~19.3-24.7)
+    "iX M60": 0.24,
+    "iX xDrive60": 0.21,
+    "iX xDrive50": 0.22,
+    "iX xDrive40": 0.22,
+    "iX": 0.22,
+    # i4 family (WLTP ~15.1-22.5)
+    "i4 M50": 0.21,
+    "i4 eDrive40": 0.18,
+    "i4 eDrive35": 0.17,
+    "i4": 0.18,
+    # i5 family (WLTP ~15.1-20.6)
+    "i5 M60": 0.20,
+    "i5 eDrive40": 0.18,
+    "i5 xDrive40": 0.18,
+    "i5": 0.18,
+    # i7 family (WLTP ~18.4-23.8)
+    "i7 M70": 0.23,
+    "i7 xDrive60": 0.21,
+    "i7 eDrive50": 0.20,
+    "i7": 0.21,
+}
+
+# Model-based default battery capacities (usable kWh, not gross)
+DEFAULT_CAPACITY_BY_MODEL: dict[str, float] = {
+    # iX1 family
+    "iX1 xDrive30": 64.7,
+    "iX1": 64.7,
+    # iX2 family
+    "iX2 xDrive30": 64.7,
+    "iX2": 64.7,
+    # iX3 NK/NA5
+    "iX3 50 xDrive": 109.0,
+    # iX3 (G08)
+    "iX3": 74.0,
+    # iX family
+    "iX M60": 105.2,
+    "iX xDrive60": 105.2,
+    "iX xDrive50": 105.2,
+    "iX xDrive40": 71.0,
+    "iX": 76.6,
+    # i4 family
+    "i4 M50": 80.7,
+    "i4 eDrive40": 80.7,
+    "i4 eDrive35": 59.4,
+    "i4": 80.7,
+    # i5 family
+    "i5 M60": 81.2,
+    "i5 eDrive40": 81.2,
+    "i5 xDrive40": 81.2,
+    "i5": 81.2,
+    # i7 family
+    "i7 M70": 101.7,
+    "i7 xDrive60": 101.7,
+    "i7 eDrive50": 101.7,
+    "i7": 101.7,
+}
+
+# Daily fetch interval for optional endpoints (charging history, tyre diagnosis)
+DAILY_FETCH_INTERVAL = 86400  # 24 hours
+
+# Key for storing deduplicated allowed VINs in entry data
+ALLOWED_VINS_KEY = "allowed_vins"

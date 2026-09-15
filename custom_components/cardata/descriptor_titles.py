@@ -1,3 +1,28 @@
+# Copyright (c) 2025, Kris Van Biesen <kvanbiesen@gmail.com>, Renaud Allard <renaud@allard.it>, Jyri Saukkonen <jyri.saukkonen+jjyksi@gmail.com>, Michal Franek <michal.franek@gmail.com>, Martijn Janssen <lion.github@fourpets.net>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
 """Descriptor title overrides generated from BMW catalogue."""
 
 DESCRIPTOR_TITLES = {
@@ -28,6 +53,7 @@ DESCRIPTOR_TITLES = {
     "vehicle.powertrain.electric.battery.preconditioning.automaticMode.statusFeedback": "Battery EV Automatic preconditioning state",
     "vehicle.powertrain.electric.battery.preconditioning.manualMode.statusFeedback": "Battery EV Manual preconditioning state",
     "vehicle.powertrain.electric.battery.preconditioning.state": "Battery EV Preconditioning state",
+    "vehicle.powertrain.electric.battery.stateOfCharge.displayed": "Battery EV State Of Charge",
     "vehicle.powertrain.electric.battery.stateOfCharge.target": "Battery EV Target state of charge",
     "vehicle.powertrain.electric.battery.stateOfCharge.targetMin": "Battery EV Target state of charge (min)",
     "vehicle.powertrain.electric.battery.stateOfCharge.targetSoCForProfessionalMode": "Battery EV Target state of charge (professional mode)",
@@ -156,10 +182,10 @@ DESCRIPTOR_TITLES = {
     "vehicle.vehicle.preConditioning.error": "Preconditioning error reason",
     "vehicle.vehicle.preConditioning.isRemoteEngineRunning": "Preconditioning engine used",
     "vehicle.vehicle.preConditioning.isRemoteEngineStartAllowed": "Preconditioning engine use allowed",
-    "vehicle.vehicle.preConditioning.remainingTime": "Preconditioning remaining  time",
-    "vehicle.cabin.hvac.preconditioning.status.comfortState": "Preconditioning  comfort state",
+    "vehicle.vehicle.preConditioning.remainingTime": "Preconditioning remaining time",
+    "vehicle.cabin.hvac.preconditioning.status.comfortState": "Preconditioning comfort state",
     "vehicle.cabin.hvac.preconditioning.status.isExteriorMirrorHeatingActive": "Preconditioning  exterior mirror heating active",
-    "vehicle.cabin.hvac.preconditioning.status.progress": "Preconditioning  progress",
+    "vehicle.cabin.hvac.preconditioning.status.progress": "Preconditioning progress",
     "vehicle.cabin.hvac.preconditioning.status.rearDefrostActive": "Preconditioning  rear defrost active",
     "vehicle.cabin.hvac.preconditioning.status.remainingRunningTime": "Preconditioning  remaining running time",
     "vehicle.cabin.hvac.preconditioning.configuration.defaultSettings.seat.row1.driverSide.cooling": "Preconditioning Default Seat cooling (front driver)",
@@ -195,6 +221,7 @@ DESCRIPTOR_TITLES = {
     "vehicle.drivetrain.fuelSystem.remainingFuel": "Range Tank level",
     "vehicle.drivetrain.lastRemainingRange": "Range Total range (last sent)",
     "vehicle.drivetrain.totalRemainingRange": "Range Estimate during charging",
+    "vehicle.drivetrain.fuelSystem.remainingFuelRange": "Range Fuel tank",
     "vehicle.drivetrain.avgElectricRangeConsumption": "Range EV Average electric consumption",
     "vehicle.drivetrain.electricEngine.hvsMaxEnergyAbsolute": "Range EV Battery energy max",
     "vehicle.drivetrain.electricEngine.kombiRemainingElectricRange": "Range EV Remaining range",
@@ -256,7 +283,7 @@ DESCRIPTOR_TITLES = {
     "vehicle.trip.segment.accumulated.drivetrain.electricEngine.energyConsumptionComfort": "Trip Energy consumption (comfort mode)",
     "vehicle.trip.segment.accumulated.drivetrain.transmission.setting.fractionDriveEcoPro": "Trip ECO Pro mode share",
     "vehicle.trip.segment.accumulated.drivetrain.transmission.setting.fractionDriveEcoProPlus": "Trip ECO Pro Plus share",
-    "vehicle.trip.segment.accumulated.drivetrain.transmission.setting.fractionDriveElectric": "Trip Electric share", 
+    "vehicle.trip.segment.accumulated.drivetrain.transmission.setting.fractionDriveElectric": "Trip Electric share",
     "vehicle.trip.segment.end.drivetrain.batteryManagement.hvSoc": "Trip Battery charge level at end of trip",
     "vehicle.trip.segment.end.time": "Trip Last trip time",
     "vehicle.trip.segment.end.travelledDistance": "Trip Last trip distance",
@@ -293,4 +320,8 @@ DESCRIPTOR_TITLES = {
     "vehicle.cabin.window.row1.passenger.status": "Window state (front passenger)",
     "vehicle.cabin.window.row2.driver.status": "Window state (rear driver)",
     "vehicle.cabin.window.row2.passenger.status": "Window state (rear passenger)",
+    # Derived/calculated sensors
+    "vehicle.predicted_soc": "Battery EV Predicted State Of Charge",
+    "vehicle.magic_soc": "Magic SOC",
+    "vehicle.manual_battery_capacity": "Battery HV Manual Capacity",
 }

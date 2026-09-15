@@ -2,19 +2,31 @@
   "config": {
     "step": {
       "user": {
-        "title": "BimmerData Streamline",
+        "title": "BMW Cardata",
         "description": "Enter your BMW CarData client ID."
       },
       "authorize": {
         "title": "Authorize BMW CarData",
-        "description": "Open {verification_url} and enter the user code {user_code} if asked. Once you've approved the device, click Submit. If approval already completed, click Submit again to continue."
+        "description": "Open {verification_url} and enter the user code {user_code} if asked. Once you've approved the device, click Submit. If approval is already completed, click Submit again to continue."
+      },
+      "blocked": {
+        "title": "Bootstrap disabled due to API rate limit",
+        "description": "The integration previously hit the BMW API daily rate limit and automatic bootstrap (container creation and mapping) has been temporarily disabled for {entry_title} until {until}. You can either wait until that time and try again, or clear the flag below to retry immediately (you may hit the rate limit again)."
+      },
+      "cleared": {
+        "title": "Bootstrap retry scheduled",
+        "description": "You have cleared the temporary disable flag for {entry_title}. The integration will attempt bootstrap again. If it still hits the BMW API rate limit, the integration will disable bootstrap until the reset time again. Alternatively, use the developer service `cardata.clean_hv_containers` to list/delete old containers (be mindful of API rate limits)."
+      },
+      "blocked_fallback": {
+        "description": "Automatic bootstrap is disabled until {until}. Clear the flag to retry now, or cancel and try again after the reset."
       }
     },
     "error": {
-      "authorization_failed": "Authorization is not complete yet (error: {error}). Please approve the device and try again.",
+      "authorization_failed": "BMW authorization was not completed. This can happen if you clicked 'Deny', closed the page before approving, the request timed out, or BMW's servers had a temporary hiccup (this is not always your fault). Error details: {error}. A new authorization link has been generated below — open it and approve, then click Submit again.",
       "device_code_failed": "BMW rejected the device authorization request ({error}). Check that the client ID is valid and try again."
     },
     "abort": {
+      "auth_failed": "BMW authorization response was incomplete (missing tokens). Please try again.",
       "reauth_device_code_failed": "BMW rejected the device authorization request ({error}). Update the client ID under Configure > Start device authorization again, or remove and re-add the integration.",
       "reauth_missing_client_id": "Client ID is missing for this integration entry. Remove and re-add the integration to authorize again.",
       "reauth_failed": "Reauthorization could not be started. Try again from the integration options."
@@ -25,6 +37,46 @@
       "init": {
         "title": "Manual actions",
         "description": "Select the action you want to run. Refresh tokens tries to just refresh the tokens without reauth. We suggest restarting HA after that if you have problems."
+      },
+      "action_settings": {
+        "title": "Settings",
+        "data": {
+          "enable_magic_soc": "Enable Magic SOC (driving consumption prediction)",
+          "enable_charging_history": "Enable Charging History (daily API poll)",
+          "enable_tyre_diagnosis": "Enable Tyre Diagnosis (daily API poll)",
+          "enable_trip_end_polling": "Enable trip-end polling",
+          "trip_poll_cooldown_minutes": "Trip-end poll cooldown (minutes)",
+          "enable_external_power_injection": "Use external power meter for charging"
+        },
+        "data_description": {
+          "enable_charging_history": "Fetches charging session history from BMW once per day. Uses 1 additional API call per vehicle per day from your 50-call daily quota.",
+          "enable_tyre_diagnosis": "Fetches tyre health and wear data from BMW once per day. Uses 1 additional API call per vehicle per day from your 50-call daily quota.",
+          "enable_trip_end_polling": "When enabled, triggers an immediate API poll each time the vehicle stops. Disable this if you make many short trips and hit the daily API limit. Scheduled polling still runs regardless.",
+          "trip_poll_cooldown_minutes": "Minimum wait between trip-end polls for the same vehicle (default: 10). Increase this to reduce API usage on frequent short trips.",
+          "enable_external_power_injection": "Allow an automation to push locally measured charging power to the SOC predictor via the cardata.update_charging_power service. While fresh local readings arrive, BMW-sourced V×A is suppressed. Leave off unless you run a smart meter and have wired it up."
+        }
+      },
+      "action_mqtt_broker": {
+        "title": "MQTT Broker",
+        "description": "Configure a custom MQTT broker instead of the BMW endpoint. Use this with bmw-mqtt-bridge to replay BMW data from a local broker, allowing multiple consumers to share a single BMW MQTT connection.",
+        "data": {
+          "custom_mqtt_enabled": "Use custom MQTT broker",
+          "custom_mqtt_host": "Broker host",
+          "custom_mqtt_port": "Broker port",
+          "custom_mqtt_username": "Username (optional)",
+          "custom_mqtt_password": "Password (optional)",
+          "custom_mqtt_tls": "TLS mode",
+          "custom_mqtt_topic_prefix": "Topic prefix (e.g. bmw/)"
+        },
+        "data_description": {
+          "custom_mqtt_enabled": "When enabled, connects to your custom broker instead of BMW's MQTT endpoint.",
+          "custom_mqtt_host": "Hostname or IP address of your MQTT broker.",
+          "custom_mqtt_port": "Port number (default: 1883 for plain TCP, 8883 for TLS).",
+          "custom_mqtt_username": "Leave empty for anonymous access.",
+          "custom_mqtt_password": "Leave empty for anonymous access.",
+          "custom_mqtt_tls": "Off = plain TCP, TLS = verified certificate, TLS (self-signed) = skip certificate validation.",
+          "custom_mqtt_topic_prefix": "The bridge topic prefix. Messages are expected at '{prefix}{vin}'. Default: bmw/"
+        }
       }
     },
     "error": {
@@ -32,9 +84,11 @@
       "runtime_missing": "Integration runtime is not ready. Try again after setup completes.",
       "no_vins": "No VINs are known yet. Wait for the stream to discover a vehicle or trigger it once manually.",
       "invalid_int": "Enter a positive integer",
-      "invalid_client_id": "Enter the BMW CarData client ID."
+      "invalid_client_id": "Enter the BMW CarData client ID.",
+      "mqtt_host_required": "Broker host is required when custom MQTT is enabled."
     },
     "abort": {
+      "auth_failed": "BMW authorization response was incomplete (missing tokens). Please try again.",
       "reauth_started": "Authorization restarted. Complete the new login flow from the notification.",
       "reauth_device_code_failed": "BMW rejected the device authorization request ({error}). Update the client ID in the integration options and try again.",
       "reauth_missing_client_id": "Client ID is missing for this integration entry. Remove and re-add the integration to authorize again.",

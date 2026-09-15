@@ -1,0 +1,553 @@
+# Copyright (c) 2025, Kris Van Biesen <kvanbiesen@gmail.com>, Renaud Allard <renaud@allard.it>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+import logging
+import os
+import sys
+import time
+import types
+from enum import StrEnum
+
+import atheris
+
+# Rejected input warns on nearly every iteration, which buried the CI job log
+# under gigabytes. Disabled globally because the effective logger name differs
+# with each harness's import style.
+logging.disable(logging.CRITICAL)
+
+# Default fuzz duration in seconds (4 hours) - exits cleanly when reached
+DEFAULT_MAX_TIME = 4 * 60 * 60
+
+CARDATA_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "custom_components", "cardata")
+)
+
+
+def _install_paho_stub() -> None:
+    if "paho.mqtt.client" in sys.modules:
+        return
+
+    paho = types.ModuleType("paho")
+    mqtt = types.ModuleType("paho.mqtt")
+    client = types.ModuleType("paho.mqtt.client")
+
+    class Client:
+        def __init__(self, *args, **kwargs) -> None:
+            return
+
+    class MQTTMessage:
+        def __init__(self, payload=None, topic=None) -> None:
+            self.payload = payload
+            self.topic = topic
+
+    client.Client = Client
+    client.MQTTMessage = MQTTMessage
+    client.MQTTv311 = 4
+    mqtt.client = client
+    paho.mqtt = mqtt
+
+    sys.modules["paho"] = paho
+    sys.modules["paho.mqtt"] = mqtt
+    sys.modules["paho.mqtt.client"] = client
+
+
+def _install_aiohttp_stub() -> None:
+    if "aiohttp" in sys.modules:
+        return
+    try:
+        import aiohttp  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    aiohttp = types.ModuleType("aiohttp")
+
+    class ClientTimeout:
+        def __init__(self, total=None) -> None:
+            self.total = total
+
+    class ClientError(Exception):
+        pass
+
+    class ClientResponseError(ClientError):
+        pass
+
+    class ContentTypeError(ClientResponseError):
+        pass
+
+    class ClientPayloadError(ClientError):
+        pass
+
+    aiohttp.ClientTimeout = ClientTimeout
+    aiohttp.ClientError = ClientError
+    aiohttp.ClientResponseError = ClientResponseError
+    aiohttp.ContentTypeError = ContentTypeError
+    aiohttp.ClientPayloadError = ClientPayloadError
+    sys.modules["aiohttp"] = aiohttp
+
+
+def _install_homeassistant_stubs() -> None:
+    if "homeassistant" in sys.modules:
+        return
+
+    homeassistant = types.ModuleType("homeassistant")
+    components = types.ModuleType("homeassistant.components")
+    device_tracker = types.ModuleType("homeassistant.components.device_tracker")
+    config_entries = types.ModuleType("homeassistant.config_entries")
+    const = types.ModuleType("homeassistant.const")
+    core = types.ModuleType("homeassistant.core")
+    helpers = types.ModuleType("homeassistant.helpers")
+    dispatcher = types.ModuleType("homeassistant.helpers.dispatcher")
+    event = types.ModuleType("homeassistant.helpers.event")
+    entity_platform = types.ModuleType("homeassistant.helpers.entity_platform")
+    restore_state = types.ModuleType("homeassistant.helpers.restore_state")
+    entity_registry = types.ModuleType("homeassistant.helpers.entity_registry")
+    device_registry = types.ModuleType("homeassistant.helpers.device_registry")
+    storage = types.ModuleType("homeassistant.helpers.storage")
+    util = types.ModuleType("homeassistant.util")
+    dt = types.ModuleType("homeassistant.util.dt")
+    unit_conversion = types.ModuleType("homeassistant.util.unit_conversion")
+
+    class UnitOfLength(StrEnum):
+        # Must stay a StrEnum with these exact values: the coordinator compares
+        # raw BMW unit strings such as "km" against these members.
+        KILOMETERS = "km"
+        MILES = "mi"
+
+    class DistanceConverter:
+        # Only km and mi are reachable from the coordinator, so anything else
+        # is stub drift and should be loud rather than silently wrong.
+        _KM_PER_MILE = 1.609344
+
+        @staticmethod
+        def convert(value: float, from_unit: str | None, to_unit: str | None) -> float:
+            if from_unit == to_unit:
+                return value
+            if from_unit == UnitOfLength.MILES and to_unit == UnitOfLength.KILOMETERS:
+                return value * DistanceConverter._KM_PER_MILE
+            if from_unit == UnitOfLength.KILOMETERS and to_unit == UnitOfLength.MILES:
+                return value / DistanceConverter._KM_PER_MILE
+            raise ValueError(f"unsupported conversion: {from_unit} to {to_unit}")
+
+    class HomeAssistant:
+        def __init__(self) -> None:
+            self.data = {}
+
+    class ConfigEntry:
+        pass
+
+    class SourceType:
+        GPS = "gps"
+
+    class TrackerEntity:
+        def __init__(self) -> None:
+            self.hass = None
+
+        def schedule_update_ha_state(self) -> None:
+            return
+
+        def async_write_ha_state(self) -> None:
+            return
+
+    class RestoreEntity:
+        def __init__(self) -> None:
+            self.hass = None
+
+        async def async_get_last_state(self):
+            return None
+
+        async def async_added_to_hass(self) -> None:
+            return
+
+        async def async_will_remove_from_hass(self) -> None:
+            return
+
+        def schedule_update_ha_state(self) -> None:
+            return
+
+        def async_write_ha_state(self) -> None:
+            return
+
+    def async_dispatcher_connect(*_args, **_kwargs):
+        return lambda: None
+
+    def async_dispatcher_send(*_args, **_kwargs) -> None:
+        return None
+
+    def async_call_later(*_args, **_kwargs):
+        return lambda: None
+
+    class _DummyEntityRegistry:
+        def async_get_entity_id(self, *_args, **_kwargs):
+            return None
+
+        def async_get(self, *_args, **_kwargs):
+            return None
+
+    def async_get_entity_registry(*_args, **_kwargs) -> _DummyEntityRegistry:
+        return _DummyEntityRegistry()
+
+    def async_entries_for_config_entry(*_args, **_kwargs) -> list:
+        return []
+
+    class Store:
+        def __init__(self, *args, **kwargs) -> None:
+            return
+
+        async def async_load(self):
+            return {}
+
+        async def async_save(self, _data) -> None:
+            return None
+
+    def parse_datetime(value):
+        if not isinstance(value, str):
+            return None
+        try:
+            from datetime import datetime
+
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    device_tracker.SourceType = SourceType
+    device_tracker.TrackerEntity = TrackerEntity
+    config_entries.ConfigEntry = ConfigEntry
+    def callback(func):
+        """Mark a function as safe to run inside the event loop, as HA's does."""
+        func._hass_callback = True
+        return func
+
+    core.HomeAssistant = HomeAssistant
+    core.callback = callback
+    dispatcher.async_dispatcher_connect = async_dispatcher_connect
+    dispatcher.async_dispatcher_send = async_dispatcher_send
+    event.async_call_later = async_call_later
+    entity_platform.AddEntitiesCallback = object
+    restore_state.RestoreEntity = RestoreEntity
+    entity_registry.async_get = async_get_entity_registry
+    entity_registry.async_entries_for_config_entry = async_entries_for_config_entry
+    device_registry.DeviceInfo = dict
+    storage.Store = Store
+    dt.parse_datetime = parse_datetime
+    const.UnitOfLength = UnitOfLength
+    unit_conversion.DistanceConverter = DistanceConverter
+    util.dt = dt
+    util.unit_conversion = unit_conversion
+
+    homeassistant.components = components
+    homeassistant.config_entries = config_entries
+    homeassistant.const = const
+    homeassistant.core = core
+    homeassistant.helpers = helpers
+    homeassistant.util = util
+    helpers.dispatcher = dispatcher
+    helpers.event = event
+    helpers.entity_platform = entity_platform
+    helpers.restore_state = restore_state
+    helpers.entity_registry = entity_registry
+    helpers.device_registry = device_registry
+    helpers.storage = storage
+
+    sys.modules["homeassistant"] = homeassistant
+    sys.modules["homeassistant.components"] = components
+    sys.modules["homeassistant.components.device_tracker"] = device_tracker
+    sys.modules["homeassistant.config_entries"] = config_entries
+    sys.modules["homeassistant.const"] = const
+    sys.modules["homeassistant.core"] = core
+    sys.modules["homeassistant.helpers"] = helpers
+    sys.modules["homeassistant.helpers.dispatcher"] = dispatcher
+    sys.modules["homeassistant.helpers.event"] = event
+    sys.modules["homeassistant.helpers.entity_platform"] = entity_platform
+    sys.modules["homeassistant.helpers.restore_state"] = restore_state
+    sys.modules["homeassistant.helpers.entity_registry"] = entity_registry
+    sys.modules["homeassistant.helpers.device_registry"] = device_registry
+    sys.modules["homeassistant.helpers.storage"] = storage
+    sys.modules["homeassistant.util"] = util
+    sys.modules["homeassistant.util.dt"] = dt
+    sys.modules["homeassistant.util.unit_conversion"] = unit_conversion
+
+
+def _install_cardata_package() -> None:
+    if "cardata" in sys.modules:
+        return
+    package = types.ModuleType("cardata")
+    package.__path__ = [CARDATA_PATH]
+    sys.modules["cardata"] = package
+
+
+_install_homeassistant_stubs()
+_install_paho_stub()
+_install_aiohttp_stub()
+_install_cardata_package()
+
+with atheris.instrument_imports():
+    from cardata import const
+    from cardata import device_tracker as device_tracker_module
+
+
+class _State:
+    def __init__(self, value, unit=None, timestamp=None) -> None:
+        self.value = value
+        self.unit = unit
+        self.timestamp = timestamp
+
+
+class _Coordinator:
+    def __init__(self, entry_id: str) -> None:
+        self.entry_id = entry_id
+        self.names = {}
+        self.device_metadata = {}
+        self.data = {}
+        self._last_locations: dict[str, tuple[float, float]] = {}
+
+    def get_state(self, vin: str, descriptor: str):
+        return self.data.get(vin, {}).get(descriptor)
+
+    def _update_location_tracking(self, vin: str, lat: float, lon: float) -> bool:
+        """Stub for location tracking - returns True if position changed."""
+        prev = self._last_locations.get(vin)
+        self._last_locations[vin] = (lat, lon)
+        if prev is None:
+            return False
+        return prev != (lat, lon)
+
+    def get_derived_is_moving(self, vin: str) -> bool | None:
+        """Stub for motion detection - always returns None."""
+        return None
+
+
+def _consume_text(fdp: atheris.FuzzedDataProvider, max_len: int) -> str:
+    return fdp.ConsumeUnicodeNoSurrogates(max_len)
+
+
+def _consume_numeric_string(fdp: atheris.FuzzedDataProvider, low: int, high: int) -> str:
+    whole = fdp.ConsumeIntInRange(low, high)
+    if fdp.ConsumeBool():
+        frac = fdp.ConsumeIntInRange(0, 999999)
+        return f"{whole}.{frac:06d}"
+    return str(whole)
+
+
+def _consume_coordinate_value(
+    fdp: atheris.FuzzedDataProvider, *, is_lat: bool
+):
+    choice = fdp.ConsumeIntInRange(0, 5)
+    if choice == 0:
+        if is_lat:
+            return fdp.ConsumeIntInRange(-90_000000, 90_000000) / 1_000_000
+        return fdp.ConsumeIntInRange(-180_000000, 180_000000) / 1_000_000
+    if choice == 1:
+        if is_lat:
+            return fdp.ConsumeIntInRange(-200_000000, 200_000000) / 1_000_000
+        return fdp.ConsumeIntInRange(-400_000000, 400_000000) / 1_000_000
+    if choice == 2:
+        return 0.0
+    if choice == 3:
+        if is_lat:
+            return _consume_numeric_string(fdp, -90, 90)
+        return _consume_numeric_string(fdp, -180, 180)
+    if choice == 4:
+        return _consume_numeric_string(fdp, -999, 999)
+    return _consume_text(fdp, 12)
+
+
+def _consume_floatish(fdp: atheris.FuzzedDataProvider):
+    choice = fdp.ConsumeIntInRange(0, 4)
+    if choice == 0:
+        return fdp.ConsumeIntInRange(-100000, 100000)
+    if choice == 1:
+        return fdp.ConsumeIntInRange(-100000, 100000) / 100.0
+    if choice == 2:
+        return _consume_numeric_string(fdp, -1000, 1000)
+    if choice == 3:
+        return _consume_text(fdp, 16)
+    return None
+
+
+def _consume_timestamp(fdp: atheris.FuzzedDataProvider) -> str | None:
+    """Build a BMW payload timestamp for one coordinate state.
+
+    The tracker parses these with fromisoformat and pairs a fix when both stamps
+    sit within 5 s of each other, so the seconds field spans a whole minute and
+    straddles that window in both directions. The suffix is drawn per coordinate
+    because a naive stamp next to an aware one is what drives the TypeError
+    fallback in the pairing code. The date and hour are fixed so that a crashing
+    input replays identically.
+    """
+
+    choice = fdp.ConsumeIntInRange(0, 5)
+    if choice == 0:
+        return None
+    if choice == 1:
+        return _consume_text(fdp, 24)
+    second = fdp.ConsumeIntInRange(0, 59)
+    micro = fdp.ConsumeIntInRange(0, 999999)
+    suffix = ("", "Z", "+00:00", "+02:00")[choice - 2]
+    return f"2025-01-01T12:00:{second:02d}.{micro:06d}{suffix}"
+
+
+def _consume_descriptor(fdp: atheris.FuzzedDataProvider) -> str:
+    choice = fdp.ConsumeIntInRange(0, 6)
+    if choice == 0:
+        return const.LOCATION_LATITUDE_DESCRIPTOR
+    if choice == 1:
+        return const.LOCATION_LONGITUDE_DESCRIPTOR
+    if choice == 2:
+        return const.LOCATION_HEADING_DESCRIPTOR
+    if choice == 3:
+        return const.LOCATION_ALTITUDE_DESCRIPTOR
+    if choice == 4:
+        return _consume_text(fdp, 16) + ".latitude"
+    if choice == 5:
+        return _consume_text(fdp, 16) + ".longitude"
+    return _consume_text(fdp, 24) or "vehicle.unknown.descriptor"
+
+
+def _maybe_adjust_times(
+    fdp: atheris.FuzzedDataProvider, tracker
+) -> None:
+    if tracker._last_lat is None or tracker._last_lon is None:
+        return
+    now = time.monotonic()
+    lat_age = fdp.ConsumeIntInRange(0, 1200)
+    lon_age = fdp.ConsumeIntInRange(0, 1200)
+    tracker._last_lat_time = now - lat_age
+    tracker._last_lon_time = now - lon_age
+    tracker.hass.async_create_task(tracker._process_coordinate_pair())
+
+
+def _safe_parse_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _existing_max_total_time(args):
+    existing = None
+    for idx, arg in enumerate(args):
+        if arg.startswith("-max_total_time="):
+            parsed = _safe_parse_int(arg.split("=", 1)[1])
+            if parsed is not None:
+                existing = parsed
+        elif arg == "-max_total_time" and idx + 1 < len(args):
+            parsed = _safe_parse_int(args[idx + 1])
+            if parsed is not None:
+                existing = parsed
+    if existing is not None and existing <= 0:
+        return None
+    return existing
+
+
+def TestOneInput(data: bytes) -> None:
+    fdp = atheris.FuzzedDataProvider(data)
+
+    vin = _consume_text(fdp, 20) or "FUZZVIN1234567890"
+    coordinator = _Coordinator("fuzz")
+    if fdp.ConsumeBool():
+        coordinator.names[vin] = _consume_text(fdp, 12) or "Car"
+
+    tracker = device_tracker_module.CardataDeviceTracker(coordinator, vin)
+    tracker.schedule_update_ha_state = lambda: None
+    tracker.async_write_ha_state = lambda: None
+
+    # Mock hass with async_create_task and add_job that run coroutines synchronously
+    class _MockHass:
+        def async_create_task(self, coro):
+            import asyncio
+
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+
+        def add_job(self, target, *args):
+            import asyncio
+
+            if asyncio.iscoroutinefunction(target):
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                loop.run_until_complete(target(*args))
+
+    tracker.hass = _MockHass()
+
+    iterations = fdp.ConsumeIntInRange(1, 50)
+    for _ in range(iterations):
+        descriptor = _consume_descriptor(fdp)
+        vin_bucket = coordinator.data.setdefault(vin, {})
+
+        if descriptor == const.LOCATION_LATITUDE_DESCRIPTOR:
+            value = _consume_coordinate_value(fdp, is_lat=True)
+            vin_bucket[descriptor] = _State(value, timestamp=_consume_timestamp(fdp))
+        elif descriptor == const.LOCATION_LONGITUDE_DESCRIPTOR:
+            value = _consume_coordinate_value(fdp, is_lat=False)
+            vin_bucket[descriptor] = _State(value, timestamp=_consume_timestamp(fdp))
+        elif descriptor == const.LOCATION_HEADING_DESCRIPTOR:
+            vin_bucket[descriptor] = _State(_consume_floatish(fdp))
+        elif descriptor == const.LOCATION_ALTITUDE_DESCRIPTOR:
+            unit = _consume_text(fdp, 6) if fdp.ConsumeBool() else None
+            vin_bucket[descriptor] = _State(_consume_floatish(fdp), unit=unit)
+        else:
+            vin_bucket[descriptor] = _State(_consume_floatish(fdp))
+
+        tracker._handle_update(vin, descriptor)
+
+        if fdp.ConsumeBool():
+            _maybe_adjust_times(fdp, tracker)
+
+        if fdp.ConsumeIntInRange(0, 9) == 0:
+            tracker._current_lat = fdp.ConsumeIntInRange(-90000000, 90000000) / 1_000_000
+            tracker._current_lon = fdp.ConsumeIntInRange(-180000000, 180000000) / 1_000_000
+
+
+def main() -> None:
+    # Ensure max time is capped so fuzzers exit before CI timeout.
+    args = sys.argv[:]
+    max_time_env = os.environ.get("FUZZ_MAX_TIME", DEFAULT_MAX_TIME)
+    max_time = _safe_parse_int(max_time_env) or DEFAULT_MAX_TIME
+    if max_time <= 0:
+        max_time = DEFAULT_MAX_TIME
+    existing_max = _existing_max_total_time(args)
+    effective_max = min(existing_max, max_time) if existing_max else max_time
+    # Hard cap to ensure we always finish before CI timeout (5h)
+    effective_max = min(effective_max, DEFAULT_MAX_TIME)
+    # Remove any existing -max_total_time args to ensure our cap takes effect
+    args = [a for a in args if not a.startswith("-max_total_time")]
+    args.append(f"-max_total_time={effective_max}")
+    print(f"Fuzzing for {effective_max} seconds ({effective_max / 3600:.1f} hours)")
+
+    atheris.Setup(args, TestOneInput)
+    atheris.Fuzz()
+    print("Fuzzing completed successfully - no issues found!")
+
+
+if __name__ == "__main__":
+    main()

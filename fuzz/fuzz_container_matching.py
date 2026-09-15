@@ -1,0 +1,236 @@
+# Copyright (c) 2025, Kris Van Biesen <kvanbiesen@gmail.com>, Renaud Allard <renaud@allard.it>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+import logging
+import os
+import sys
+import types
+
+import atheris
+
+# Rejected input warns on nearly every iteration, which buried the CI job log
+# under gigabytes. Disabled globally because the effective logger name differs
+# with each harness's import style.
+logging.disable(logging.CRITICAL)
+
+# Default fuzz duration in seconds (4 hours) - exits cleanly when reached
+DEFAULT_MAX_TIME = 4 * 60 * 60
+
+CARDATA_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "custom_components", "cardata")
+)
+
+
+def _install_aiohttp_stub() -> None:
+    if "aiohttp" in sys.modules:
+        return
+    try:
+        import aiohttp  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    aiohttp = types.ModuleType("aiohttp")
+
+    class ClientTimeout:
+        def __init__(self, total=None) -> None:
+            self.total = total
+
+    class ClientError(Exception):
+        pass
+
+    class ClientResponseError(ClientError):
+        pass
+
+    class ContentTypeError(ClientResponseError):
+        pass
+
+    class ClientPayloadError(ClientError):
+        pass
+
+    aiohttp.ClientTimeout = ClientTimeout
+    aiohttp.ClientError = ClientError
+    aiohttp.ClientResponseError = ClientResponseError
+    aiohttp.ContentTypeError = ContentTypeError
+    aiohttp.ClientPayloadError = ClientPayloadError
+    sys.modules["aiohttp"] = aiohttp
+
+
+def _install_cardata_package() -> None:
+    if "cardata" in sys.modules:
+        return
+    package = types.ModuleType("cardata")
+    package.__path__ = [CARDATA_PATH]
+    sys.modules["cardata"] = package
+
+
+_install_aiohttp_stub()
+_install_cardata_package()
+
+with atheris.instrument_imports():
+    from cardata import api_parsing
+    from cardata import const
+    from cardata import container as container_module
+
+
+def _consume_text(fdp: atheris.FuzzedDataProvider, max_len: int) -> str:
+    return fdp.ConsumeUnicodeNoSurrogates(max_len)
+
+
+def _consume_name_or_purpose(fdp: atheris.FuzzedDataProvider, expected: str, max_len: int) -> str:
+    """Return the value the matcher accepts, or free-form text.
+
+    The matcher compares for exact equality, so fuzzer text alone can never
+    reach the code behind the guard.
+    """
+
+    if fdp.ConsumeBool():
+        return expected
+    return _consume_text(fdp, max_len)
+
+
+def _consume_descriptor_value(fdp: atheris.FuzzedDataProvider):
+    choice = fdp.ConsumeIntInRange(0, 5)
+    if choice == 0:
+        return _consume_text(fdp, 24)
+    if choice == 1:
+        return fdp.ConsumeIntInRange(-1000, 1000)
+    if choice == 2:
+        return fdp.ConsumeBool()
+    if choice == 3:
+        return None
+    if choice == 4:
+        return [_consume_text(fdp, 10) for _ in range(fdp.ConsumeIntInRange(0, 4))]
+    return {"k": _consume_text(fdp, 8)}
+
+
+def _consume_descriptor_list(fdp: atheris.FuzzedDataProvider):
+    return [
+        _consume_descriptor_value(fdp)
+        for _ in range(fdp.ConsumeIntInRange(0, 8))
+    ]
+
+
+def _consume_descriptors(fdp: atheris.FuzzedDataProvider) -> list:
+    """Return the descriptor set the integration wants, or a fuzzer-built one."""
+
+    if fdp.ConsumeBool():
+        return list(const.HV_BATTERY_DESCRIPTORS)
+    return _consume_descriptor_list(fdp)
+
+
+def _consume_container_dict(fdp: atheris.FuzzedDataProvider) -> dict:
+    payload = {}
+    if fdp.ConsumeBool():
+        payload["purpose"] = _consume_name_or_purpose(fdp, const.HV_BATTERY_CONTAINER_PURPOSE, 40)
+    if fdp.ConsumeBool():
+        payload["name"] = _consume_name_or_purpose(fdp, const.HV_BATTERY_CONTAINER_NAME, 40)
+    if fdp.ConsumeBool():
+        payload["containerId"] = _consume_text(fdp, 24)
+    if fdp.ConsumeBool():
+        payload["technicalDescriptors"] = _consume_descriptors(fdp)
+    if fdp.ConsumeBool():
+        payload[_consume_text(fdp, 10)] = _consume_descriptor_value(fdp)
+    return payload
+
+
+def _consume_payload_shape(fdp: atheris.FuzzedDataProvider):
+    choice = fdp.ConsumeIntInRange(0, 4)
+    if choice == 0:
+        return [_consume_container_dict(fdp) for _ in range(fdp.ConsumeIntInRange(0, 6))]
+    if choice == 1:
+        return {"containers": [_consume_container_dict(fdp) for _ in range(fdp.ConsumeIntInRange(0, 6))]}
+    if choice == 2:
+        return {"items": [_consume_container_dict(fdp) for _ in range(fdp.ConsumeIntInRange(0, 6))]}
+    if choice == 3:
+        return _consume_descriptor_list(fdp)
+    return _consume_text(fdp, 80)
+
+
+def _safe_parse_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _existing_max_total_time(args):
+    existing = None
+    for idx, arg in enumerate(args):
+        if arg.startswith("-max_total_time="):
+            parsed = _safe_parse_int(arg.split("=", 1)[1])
+            if parsed is not None:
+                existing = parsed
+        elif arg == "-max_total_time" and idx + 1 < len(args):
+            parsed = _safe_parse_int(args[idx + 1])
+            if parsed is not None:
+                existing = parsed
+    if existing is not None and existing <= 0:
+        return None
+    return existing
+
+
+def TestOneInput(data: bytes) -> None:
+    fdp = atheris.FuzzedDataProvider(data)
+    descriptors = _consume_descriptor_list(fdp)
+    str_only = [d for d in descriptors if isinstance(d, str)]
+    container_module.CardataContainerManager.compute_signature(str_only)
+
+    payload = _consume_payload_shape(fdp)
+    containers = api_parsing.extract_container_items(payload)
+
+    manager = object.__new__(container_module.CardataContainerManager)
+    # An empty signature is a state production cannot reach, since __init__
+    # always stores a sha1 hexdigest, so compute one either way.
+    desired = list(const.HV_BATTERY_DESCRIPTORS) if fdp.ConsumeBool() else str_only
+    manager._descriptor_signature = container_module.CardataContainerManager.compute_signature(desired)
+
+    for container in containers:
+        manager._matches_hv_container(container)
+
+
+def main() -> None:
+    # Ensure max time is capped so fuzzers exit before CI timeout.
+    args = sys.argv[:]
+    max_time_env = os.environ.get("FUZZ_MAX_TIME", DEFAULT_MAX_TIME)
+    max_time = _safe_parse_int(max_time_env) or DEFAULT_MAX_TIME
+    if max_time <= 0:
+        max_time = DEFAULT_MAX_TIME
+    existing_max = _existing_max_total_time(args)
+    effective_max = min(existing_max, max_time) if existing_max else max_time
+    # Hard cap to ensure we always finish before CI timeout (5h)
+    effective_max = min(effective_max, DEFAULT_MAX_TIME)
+    # Remove any existing -max_total_time args to ensure our cap takes effect
+    args = [a for a in args if not a.startswith("-max_total_time")]
+    args.append(f"-max_total_time={effective_max}")
+    print(f"Fuzzing for {effective_max} seconds ({effective_max / 3600:.1f} hours)")
+
+    atheris.Setup(args, TestOneInput)
+    atheris.Fuzz()
+    print("Fuzzing completed successfully - no issues found!")
+
+
+if __name__ == "__main__":
+    main()

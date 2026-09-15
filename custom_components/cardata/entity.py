@@ -1,37 +1,111 @@
+# Copyright (c) 2025, Renaud Allard <renaud@allard.it>, Kris Van Biesen <kvanbiesen@gmail.com>, Jyri Saukkonen <jyri.saukkonen+jjyksi@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
 """Base entity classes for BMW CarData."""
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+import asyncio
+import logging
+import re
+import time
+from collections.abc import Callable
 
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import DOMAIN
 from .coordinator import CardataCoordinator
 from .descriptor_titles import DESCRIPTOR_TITLES
+from .utils import redact_vin_in_text
+
+_LOGGER = logging.getLogger(__name__)
+
+# How long (seconds) an entity will wait for coordinator-provided vehicle name
+# before writing its original_name into the registry. Short default avoids long
+# startup delays while still giving bootstrap a chance to populate metadata.
+_ENTITY_NAME_WAIT = 2.0
 
 
 class CardataEntity(RestoreEntity):
+    """Base entity for Cardata integration."""
+
     def __init__(self, coordinator: CardataCoordinator, vin: str, descriptor: str) -> None:
         self._coordinator = coordinator
         self._vin = vin
         self._descriptor = descriptor
-        self._attr_has_entity_name = True
+
+        # Base name derived from descriptor (prefer DESCRIPTOR_TITLES), fallback to VIN
+        self._base_name = self._format_name() or vin
+
+        # Keep unique_id as VIN + descriptor (do not change unique_id format)
         self._attr_unique_id = f"{vin}_{descriptor}"
-        self._base_name = self._format_name()
-        self._attr_name = self._base_name
+
+        # Full public name (may be prefixed with vehicle name)
+        self._attr_name = self._compute_full_name()
+
         self._attr_available = True
         self._name_unsub: Callable[[], None] | None = None
 
+    def _resolve_vin(self) -> str:
+        """Resolve VIN alias if coordinator provides resolver."""
+        resolver = getattr(self._coordinator, "_resolve_vin_alias", lambda v: v)
+        return resolver(self._vin)
+
+    def _format_name(self) -> str:
+        """Return a human-friendly title for a descriptor.
+
+        Priority:
+          1. DESCRIPTOR_TITLES mapping (explicit catalogue overrides).
+          2. Derive from descriptor tokens (dots/underscores -> words, drop 'vehicle').
+        """
+        if not self._descriptor:
+            return ""
+
+        # 1) Prefer explicit mapping from catalogue
+        title = DESCRIPTOR_TITLES.get(self._descriptor)
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+
+        # 2) Fallback: derive from descriptor tokens
+        parts = [
+            p for p in self._descriptor.replace("_", " ").replace(".", " ").split() if p and p.lower() != "vehicle"
+        ]
+        if not parts:
+            return ""
+        return " ".join(p.capitalize() for p in parts)
+
     @property
     def device_info(self) -> DeviceInfo:
-        metadata = self._coordinator.device_metadata.get(self._vin, {})
-        name = metadata.get("name") or self._coordinator.names.get(self._vin, self._vin)
-        manufacturer = metadata.get("manufacturer", "BMW")
+        resolved_vin = self._resolve_vin()
+        metadata = self._coordinator.device_metadata.get(resolved_vin, {})
+        name = metadata.get("name") or self._coordinator.names.get(resolved_vin, resolved_vin)
+        manufacturer = metadata.get("manufacturer", "bmw")
         info: DeviceInfo = {
-            "identifiers": {(DOMAIN, self._vin)},
+            "identifiers": {(DOMAIN, resolved_vin)},
             "manufacturer": manufacturer,
             "name": name,
         }
@@ -47,15 +121,16 @@ class CardataEntity(RestoreEntity):
 
     @property
     def available(self) -> bool:
-        return True
+        return self._attr_available
 
     @property
     def extra_state_attributes(self) -> dict:
-        state = self._coordinator.get_state(self._vin, self._descriptor)
+        resolved_vin = self._resolve_vin()
+        state = self._coordinator.get_state(resolved_vin, self._descriptor)
         if not state:
             return {}
         attrs = {}
-        if state.timestamp:
+        if getattr(state, "timestamp", None):
             attrs["timestamp"] = state.timestamp
         return attrs
 
@@ -67,33 +142,88 @@ class CardataEntity(RestoreEntity):
     def vin(self) -> str:
         return self._vin
 
-    def _format_name(self) -> str:
-        if self._descriptor in DESCRIPTOR_TITLES:
-            return DESCRIPTOR_TITLES[self._descriptor]
-        parts = [
-            p
-            for p in self._descriptor.replace("_", " ").replace(".", " ").split()
-            if p and p.lower() != "vehicle"
-        ]
-        title = " ".join(p.capitalize() for p in parts)
-        return title or self._vin
+    def _get_vehicle_name(self) -> str | None:
+        resolved_vin = self._resolve_vin()
+        metadata = self._coordinator.device_metadata.get(resolved_vin)
+        if metadata and metadata.get("name"):
+            return metadata["name"]
+        return self._coordinator.names.get(resolved_vin)
+
+    def _strip_leading_vehicle_name(self, base: str, vehicle_name: str) -> str:
+        """Remove a leading vehicle name from base to avoid double-prefixing.
+
+        Matches case-insensitively and treats underscores/spaces as equivalent.
+        Example: base="330e Door Open" and vehicle_name="330e" -> "Door Open"
+        """
+        if not base or not vehicle_name:
+            return base
+        # Normalize whitespace and underscores
+        norm_base = re.sub(r"[_\s]+", " ", base).strip()
+        norm_vehicle = re.sub(r"[_\s]+", " ", vehicle_name).strip()
+        if not norm_vehicle:
+            return base
+        if norm_base.lower().startswith(norm_vehicle.lower()):
+            stripped = norm_base[len(norm_vehicle) :].strip()
+            # Remove any leftover leading punctuation/underscores/spaces
+            stripped = re.sub(r"^[\s_\-:]+", "", stripped)
+            # If stripping leaves an empty string, return original base to avoid blank names
+            return stripped or base
+        return base
+
+    def _compute_full_name(self) -> str:
+        """Compute the public name (vehicle prefix + base) while avoiding double-prefix."""
+        base = self._base_name or self._vin
+        vehicle_name = self._get_vehicle_name()
+        if not vehicle_name:
+            return base
+
+        # Strip leading vehicle name from base to avoid double-prefixing
+        stripped_base = self._strip_leading_vehicle_name(base, vehicle_name)
+
+        # If stripped_base still begins with vehicle_name (case-insensitive), return it as-is
+        if stripped_base.lower().startswith(vehicle_name.lower()):
+            return stripped_base
+
+        return f"{vehicle_name} {stripped_base}"
 
     def _update_name(self, *, write_state: bool = True) -> None:
-        new_name = self._base_name or self._vin
+        """Update the entity name and optionally write state to set original_name in registry."""
+        new_name = self._compute_full_name()
         if new_name == self._attr_name:
             return
         self._attr_name = new_name
-        if write_state and self.hass:
+        if write_state and getattr(self, "hass", None):
+            # schedule_update_ha_state causes Home Assistant to persist original_name for new entities.
             self.schedule_update_ha_state()
 
     async def async_added_to_hass(self) -> None:
+        """Handle entity being added: subscribe to name updates and ensure original_name is set."""
         await super().async_added_to_hass()
-        self._update_name(write_state=False)
+
+        # Subscribe first so signal-driven name updates are received immediately
         self._name_unsub = async_dispatcher_connect(
             self.hass,
             f"{DOMAIN}_{self._coordinator.entry_id}_name",
             self._handle_vehicle_name,
         )
+
+        # Wait briefly for the coordinator to supply vehicle name for our VIN so original_name
+        # (written below) will include the correct vehicle prefix. This is a small, non-blocking
+        # wait to avoid racing with bootstrap/telemetry.
+        # Use 200ms intervals (10 iterations max) to balance responsiveness with efficiency.
+        deadline = time.monotonic() + _ENTITY_NAME_WAIT
+        while time.monotonic() < deadline:
+            if self._get_vehicle_name():
+                break
+            await asyncio.sleep(0.2)
+
+        # Now write the prefixed name into Home Assistant so the registry/original_name is set.
+        # This ensures HA will generate the desired entity_id immediately.
+        try:
+            self._update_name(write_state=True)
+        except Exception:
+            entity_id = getattr(self, "entity_id", "<unknown>")
+            _LOGGER.exception("Failed to update name for entity %s", redact_vin_in_text(entity_id))
 
     async def async_will_remove_from_hass(self) -> None:
         if self._name_unsub:
@@ -102,6 +232,9 @@ class CardataEntity(RestoreEntity):
         await super().async_will_remove_from_hass()
 
     def _handle_vehicle_name(self, vin: str, name: str) -> None:
-        if vin != self._vin:
+        # Coordinator sends canonical VIN; resolve our vin and compare
+        resolved_vin = self._resolve_vin()
+        if vin != resolved_vin:
             return
-        self._update_name()
+        # Update name (do not force writing to registry again)
+        self._update_name(write_state=False)

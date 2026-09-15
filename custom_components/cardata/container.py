@@ -1,14 +1,42 @@
+# Copyright (c) 2025, Renaud Allard <renaud@allard.it>, Kris Van Biesen <kvanbiesen@gmail.com>, Jyri Saukkonen <jyri.saukkonen+jjyksi@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
 """Helpers for managing BMW CarData containers."""
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import hashlib
-from typing import Any, Dict, Iterable, List, Optional
+import json
+import logging
+from collections.abc import Iterable
+from typing import Any
 
 import aiohttp
 
+from .api_parsing import extract_container_items
 from .const import (
     API_BASE_URL,
     API_VERSION,
@@ -17,14 +45,19 @@ from .const import (
     HV_BATTERY_DESCRIPTORS,
 )
 from .debug import debug_enabled
+from .utils import redact_sensitive_data, redact_vin_in_text
 
 _LOGGER = logging.getLogger(__name__)
+
+# Timeout for container API requests (seconds)
+# Increased from 15s to handle slow networks and server load
+CONTAINER_REQUEST_TIMEOUT = 30
 
 
 class CardataContainerError(Exception):
     """Raised when BMW CarData container management fails."""
 
-    def __init__(self, message: str, *, status: Optional[int] = None) -> None:
+    def __init__(self, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
 
@@ -37,21 +70,28 @@ class CardataContainerManager:
         *,
         session: aiohttp.ClientSession,
         entry_id: str,
-        initial_container_id: Optional[str] = None,
+        initial_container_id: str | None = None,
     ) -> None:
         self._session = session
         self._entry_id = entry_id
-        self._container_id: Optional[str] = initial_container_id
+        self._container_id: str | None = initial_container_id
+        self._container_signature: str | None = None
         self._lock = asyncio.Lock()
         descriptors = list(dict.fromkeys(HV_BATTERY_DESCRIPTORS))
         self._desired_descriptors = tuple(descriptors)
         self._descriptor_signature = self.compute_signature(descriptors)
 
     @property
-    def container_id(self) -> Optional[str]:
+    def container_id(self) -> str | None:
         """Return the currently known container identifier."""
 
         return self._container_id
+
+    @property
+    def container_signature(self) -> str | None:
+        """Return the signature of the last ensured/reused container, if known."""
+
+        return self._container_signature
 
     @property
     def descriptor_signature(self) -> str:
@@ -67,13 +107,33 @@ class CardataContainerManager:
         joined = "|".join(normalized)
         return hashlib.sha1(joined.encode("utf-8")).hexdigest()
 
-    def sync_from_entry(self, container_id: Optional[str]) -> None:
-        """Synchronize the known container id with stored config data."""
+    def sync_from_entry(self, container_id: str | None, signature: str | None = None) -> None:
+        """Synchronize the known container id (and optional signature) with stored config data."""
 
         self._container_id = container_id
+        self._container_signature = signature
 
-    async def async_ensure_hv_container(self, access_token: Optional[str]) -> Optional[str]:
-        """Ensure the HV battery container exists and is active."""
+    async def async_ensure_hv_container(
+        self,
+        access_token: str | None,
+        rate_limiter: Any | None = None,
+    ) -> str | None:
+        """Ensure the HV battery container exists and is active.
+
+        Behavior controlled by CONTAINER_REUSE_EXISTING in const.py:
+        - True (default): Lists existing containers and reuses matching ones
+          Pros: Prevents container accumulation, good for testing/reinstalls
+          Cons: Costs 1 extra API call on first install
+        - False: Always creates new container
+          Pros: Saves 1 API call on first install
+          Cons: Creates orphaned containers on reinstalls
+
+        Matching criteria (when reuse enabled):
+        - Purpose: "High voltage battery telemetry"
+        - Name: "Bmw Cardata HV Battery"
+        - Descriptors: SHA1 signature of descriptor list
+        """
+        from .const import CONTAINER_REUSE_EXISTING
 
         if not access_token:
             if debug_enabled():
@@ -84,21 +144,101 @@ class CardataContainerManager:
             return self._container_id
 
         async with self._lock:
+            # If we have a cached container ID, just reuse it
             if self._container_id:
                 if debug_enabled():
                     _LOGGER.debug(
-                        "[%s] Using cached HV container %s without validation",
+                        "[%s] Using cached HV container %s",
                         self._entry_id,
                         self._container_id,
                     )
                 return self._container_id
 
+            if rate_limiter:
+                can_create, block_reason = rate_limiter.can_create_container()
+                if not can_create:
+                    _LOGGER.warning(
+                        "[%s] Cannot create new container due to rate limiting: %s", self._entry_id, block_reason
+                    )
+                    return None
+
+            # Check if container reuse is enabled
+            if CONTAINER_REUSE_EXISTING:
+                # List existing containers to find matching one (prevents accumulation!)
+                _LOGGER.debug(
+                    "[%s] Container reuse enabled - searching for existing matching container...",
+                    self._entry_id,
+                )
+
+                try:
+                    containers = await self._list_containers(access_token)
+                    for container in containers:
+                        if self._matches_hv_container(container):
+                            found_id = container.get("containerId")
+                            if found_id:
+                                self._container_id = found_id
+                                self._container_signature = self._descriptor_signature
+                                _LOGGER.info(
+                                    "[%s] Found existing matching HV container %s - reusing to prevent accumulation",
+                                    self._entry_id,
+                                    found_id,
+                                )
+                                return self._container_id
+
+                    # No strict match: fall back to reusing an existing container with the same
+                    # name/purpose even if descriptors differ. This avoids hitting BMW's
+                    # container limits after reinstalls/updates while still allowing telematics
+                    # to work (some newer descriptors may be missing until a manual reset).
+                    for container in containers:
+                        if self._matches_hv_container_name_purpose(container):
+                            found_id = container.get("containerId")
+                            if not found_id:
+                                continue
+                            descriptors = container.get("technicalDescriptors")
+                            signature = None
+                            if isinstance(descriptors, list):
+                                signature = self.compute_signature(
+                                    [item for item in descriptors if isinstance(item, str)]
+                                )
+                            self._container_id = found_id
+                            self._container_signature = signature
+                            _LOGGER.warning(
+                                "[%s] Found existing HV container %s with different descriptors; reusing it. "
+                                "If some sensors are missing, use 'Reset HV Battery Container' to recreate it.",
+                                self._entry_id,
+                                found_id,
+                            )
+                            return self._container_id
+
+                    _LOGGER.debug(
+                        "[%s] No matching container found, will create new one",
+                        self._entry_id,
+                    )
+
+                except (CardataContainerError, KeyError, TypeError, ValueError) as err:
+                    _LOGGER.warning(
+                        "[%s] Failed to list existing containers: %s. Will attempt to create new one.",
+                        self._entry_id,
+                        redact_sensitive_data(str(err)),
+                    )
+            else:
+                _LOGGER.debug(
+                    "[%s] Container reuse disabled - will create new container",
+                    self._entry_id,
+                )
+
+            # No cached ID and (no match found OR reuse disabled) - create new one
             created_id = await self._create_container(access_token)
+
+            if created_id and rate_limiter:
+                rate_limiter.record_creation()
+
             self._container_id = created_id
-            _LOGGER.info("[%s] Created HV battery container %s", self._entry_id, created_id)
+            self._container_signature = self._descriptor_signature
+            _LOGGER.info("[%s] Created new HV battery container %s", self._entry_id, created_id)
             return self._container_id
 
-    async def async_reset_hv_container(self, access_token: Optional[str]) -> Optional[str]:
+    async def async_reset_hv_container(self, access_token: str | None, rate_limiter: Any | None = None) -> str | None:
         """Delete existing HV telemetry containers and create a fresh one."""
 
         if not access_token:
@@ -110,13 +250,24 @@ class CardataContainerManager:
             return self._container_id
 
         async with self._lock:
+            if rate_limiter:
+                can_create, block_reason = rate_limiter.can_create_container()
+                if not can_create:
+                    _LOGGER.warning(
+                        "[%s] Cannot reset container due to rate limiting: %s", self._entry_id, block_reason
+                    )
+                    raise CardataContainerError(f"Container creation rate limited: {block_reason}")
+
             containers = await self._list_containers(access_token)
-            deleted_ids: List[str] = []
+            deleted_ids: list[str] = []
             for container in containers:
                 container_id = container.get("containerId")
                 if not isinstance(container_id, str):
                     continue
-                if not self._matches_hv_container(container):
+                # Use name+purpose match (not strict signature) so reset also
+                # cleans up containers with older/different descriptor sets,
+                # including loosely-reused ones.
+                if not self._matches_hv_container_name_purpose(container):
                     continue
                 try:
                     await self._delete_container(access_token, container_id)
@@ -125,7 +276,7 @@ class CardataContainerManager:
                         "[%s] Failed to delete container %s: %s",
                         self._entry_id,
                         container_id,
-                        err,
+                        redact_sensitive_data(str(err)),
                     )
                     continue
                 deleted_ids.append(container_id)
@@ -140,7 +291,11 @@ class CardataContainerManager:
 
             self._container_id = None
             new_id = await self._create_container(access_token)
+            if new_id and rate_limiter:
+                rate_limiter.record_creation()
+
             self._container_id = new_id
+            self._container_signature = self._descriptor_signature
             _LOGGER.info(
                 "[%s] Reset HV telemetry container; new container id %s",
                 self._entry_id,
@@ -154,48 +309,43 @@ class CardataContainerManager:
             "purpose": HV_BATTERY_CONTAINER_PURPOSE,
             "technicalDescriptors": list(self._desired_descriptors),
         }
-        response = await self._request(
-            "POST", "/customers/containers", access_token, json_body=payload
-        )
+        response = await self._request("POST", "/customers/containers", access_token, json_body=payload)
         container_id = response.get("containerId") if isinstance(response, dict) else None
         if not container_id:
-            raise CardataContainerError(
-                "Container creation response missing containerId"
-            )
+            raise CardataContainerError("Container creation response missing containerId")
         return container_id
 
-    async def _list_containers(self, access_token: str) -> List[Dict[str, Any]]:
+    async def _list_containers(self, access_token: str) -> list[dict[str, Any]]:
         response = await self._request("GET", "/customers/containers", access_token)
-        if isinstance(response, list):
-            containers = [item for item in response if isinstance(item, dict)]
-        elif isinstance(response, dict):
-            possible = response.get("containers")
-            if isinstance(possible, list):
-                containers = [item for item in possible if isinstance(item, dict)]
-            else:
-                containers = []
-        else:
-            containers = []
-        return containers
+        return extract_container_items(response)
 
-    def _matches_hv_container(self, container: Dict[str, Any]) -> bool:
+    def _matches_hv_container_name_purpose(self, container: dict[str, Any]) -> bool:
+        """Loose match: name and purpose match, descriptor signature may differ."""
+
         if not isinstance(container, dict):
             return False
         purpose = container.get("purpose")
         name = container.get("name")
+        return (
+            isinstance(purpose, str)
+            and purpose == HV_BATTERY_CONTAINER_PURPOSE
+            and isinstance(name, str)
+            and name == HV_BATTERY_CONTAINER_NAME
+        )
+
+    def _matches_hv_container(self, container: dict[str, Any]) -> bool:
+        """Strict match: name, purpose, and descriptor signature must all match."""
+
+        if not self._matches_hv_container_name_purpose(container):
+            return False
+
         descriptors = container.get("technicalDescriptors")
         signature = None
+
         if isinstance(descriptors, list):
-            signature = self.compute_signature(
-                [item for item in descriptors if isinstance(item, str)]
-            )
-        return any(
-            [
-                isinstance(purpose, str) and purpose == HV_BATTERY_CONTAINER_PURPOSE,
-                isinstance(name, str) and name == HV_BATTERY_CONTAINER_NAME,
-                signature == self._descriptor_signature,
-            ]
-        )
+            signature = self.compute_signature([item for item in descriptors if isinstance(item, str)])
+
+        return signature == self._descriptor_signature
 
     async def _delete_container(self, access_token: str, container_id: str) -> None:
         try:
@@ -205,7 +355,7 @@ class CardataContainerManager:
                 access_token,
             )
         except CardataContainerError as err:
-            if err.status == 404:
+            if err.status in (404, 208):
                 if debug_enabled():
                     _LOGGER.debug(
                         "[%s] Container %s already deleted",
@@ -221,7 +371,7 @@ class CardataContainerManager:
         path: str,
         access_token: str,
         *,
-        json_body: Optional[Dict[str, Any]] = None,
+        json_body: dict[str, Any] | None = None,
     ) -> Any:
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -232,23 +382,53 @@ class CardataContainerManager:
             headers["Content-Type"] = "application/json"
         url = f"{API_BASE_URL}{path}"
         if debug_enabled():
-            _LOGGER.debug("[%s] %s %s", self._entry_id, method, url)
+            _LOGGER.debug("[%s] %s %s", self._entry_id, method, redact_vin_in_text(url))
         try:
             async with self._session.request(
                 method,
                 url,
                 headers=headers,
                 json=json_body,
-                timeout=aiohttp.ClientTimeout(total=15),
+                timeout=aiohttp.ClientTimeout(total=CONTAINER_REQUEST_TIMEOUT),
             ) as response:
-                if response.status in (200, 201):
-                    return await response.json(content_type=None)
+                # Read body once to ensure connection cleanup, then parse
+                try:
+                    body_bytes = await response.read()
+                except (aiohttp.ClientPayloadError, aiohttp.ClientResponseError) as read_err:
+                    raise CardataContainerError(
+                        f"Failed to read response body: {read_err}",
+                        status=response.status,
+                    ) from read_err
+
                 if response.status == 204:
                     return {}
-                text = await response.text()
+
+                if response.status in (200, 201):
+                    try:
+                        return json.loads(body_bytes)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+                        # API returned success status but invalid/non-JSON body
+                        try:
+                            text = body_bytes.decode("utf-8", errors="replace")[:200].strip()
+                        except Exception:
+                            text = "undecodable"
+                        safe_text = redact_vin_in_text(text) if text else "empty"
+                        raise CardataContainerError(
+                            f"Invalid JSON in response: {safe_text}",
+                            status=response.status,
+                        ) from err
+
+                # Error status - decode body for error message
+                try:
+                    text = body_bytes.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    text = ""
+                safe_text = redact_vin_in_text(text) if text else "no response body"
                 raise CardataContainerError(
-                    f"HTTP {response.status}: {text.strip() or 'no response body'}",
+                    f"HTTP {response.status}: {safe_text}",
                     status=response.status,
                 )
+        except TimeoutError as err:
+            raise CardataContainerError(f"Request timed out after {CONTAINER_REQUEST_TIMEOUT} seconds") from err
         except aiohttp.ClientError as err:
-            raise CardataContainerError(f"Network error: {err}") from err
+            raise CardataContainerError(f"Network error: {redact_sensitive_data(str(err))}") from err
