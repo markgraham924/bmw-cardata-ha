@@ -9,4 +9,16 @@
 __pycache__/
 *.pyc
 *.pyo
- 
+.vs*
+.venv/
+
+# APK files
+*.xapk
+*.apk
+
+# libFuzzer crash reproducers and corpus
+/crashes/
+/corpus/
+
+# Scratch space
+/tmp/

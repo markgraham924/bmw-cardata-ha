@@ -1,0 +1,1100 @@
+# Copyright (c) 2025, Renaud Allard <renaud@allard.it>, Kris Van Biesen <kvanbiesen@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+"""SOC prediction wiring between raw descriptors and prediction engines.
+
+Bridges coordinator state with SOCPredictor (charging) and MagicSOCPredictor (driving).
+Standalone functions take explicit parameters; process_soc_descriptors takes a coordinator
+reference for access to broader state.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
+
+from .const import (
+    DESC_BATTERY_SIZE_MAX,
+    DESC_CHARGING_AC_AMPERE,
+    DESC_CHARGING_AC_VOLTAGE,
+    DESC_CHARGING_LEVEL,
+    DESC_CHARGING_PHASES,
+    DESC_CHARGING_PORT_PLUG_EVENT,
+    DESC_CHARGING_PORT_PLUGGED,
+    DESC_CHARGING_PORT_STATUS,
+    DESC_CHARGING_POWER,
+    DESC_CHARGING_STATUS,
+    DESC_CHARGING_TIME_REMAINING,
+    DESC_FUEL_LEVEL,
+    DESC_MAX_ENERGY,
+    DESC_REMAINING_FUEL,
+    DESC_SOC_DISPLAYED,
+    DESC_SOC_HEADER,
+    DESC_TRAVELLED_DISTANCE,
+    DESC_TRIP_HVSOC,
+    DOMAIN,
+    MAGIC_SOC_DESCRIPTOR,
+    PHASE_COUNT_LEAD_SECONDS,
+    PREDICTED_SOC_DESCRIPTOR,
+)
+from .descriptor_state import DescriptorState
+from .magic_soc import MagicSOCPredictor
+from .soc_prediction import SOCPredictor
+from .utils import redact_vin
+
+if TYPE_CHECKING:
+    from .coordinator import CardataCoordinator
+
+_LOGGER = logging.getLogger(__name__)
+
+_OVERRIDE_AUX_POWER = 0.3  # kW - estimated auxiliary power load during charging (for SOC prediction)
+
+# How far a manual battery capacity may sit from BMW's own before the phase
+# count can no longer be inferred from it.
+_CAPACITY_TOLERANCE = 0.20
+
+
+def _descriptor_float(state: DescriptorState | None) -> float | None:
+    """Extract a float from a descriptor state, returning None on failure."""
+    if state is None or state.value is None:
+        return None
+    try:
+        return float(state.value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _descriptor_phases(state: DescriptorState | None) -> int | None:
+    """Extract number of phases from a BMW phaseNumber descriptor state.
+
+    The BMW API returns string values such as '1-PHASES', '2-PHASES', '3-PHASES',
+    'NO_CHARGING', or 'INVALID' rather than plain numbers.  Falls back to numeric
+    parsing so that any future numeric representation also works.
+
+    Returns None when the value is absent, unparseable, or indicates no charging.
+    """
+    if state is None or state.value is None:
+        return None
+    value = str(state.value).strip()
+    # BMW string format: "1-PHASES", "2-PHASES", "3-PHASES"
+    if "-PHASES" in value:
+        try:
+            return int(value.split("-")[0])
+        except (ValueError, IndexError):
+            return None
+    # Numeric fallback
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _descriptor_timestamp(state: DescriptorState | None) -> datetime | None:
+    """Return a descriptor's BMW timestamp as a datetime, or None when unusable."""
+    if state is None or state.timestamp is None:
+        return None
+    try:
+        return datetime.fromisoformat(state.timestamp)
+    except (ValueError, TypeError):
+        return None
+
+
+def _is_plugged_in(value: Any) -> bool:
+    """Whether a plug state descriptor value means the cable is connected."""
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().upper()
+    return text.startswith("CONNECT") or text in ("TRUE", "ASN_ISTRUE", "PLUGGED", "1")
+
+
+def _plug_in_timestamp(vehicle_state: dict[str, DescriptorState]) -> datetime | None:
+    """Return when the cable was last plugged in, as reported by BMW.
+
+    Only genuine plug state descriptors qualify.  The charging status is not
+    usable here because it leaves CHARGINGACTIVE on every pause, so a solar or
+    timer driven charge would look like a string of separate plug-ins.
+
+    Returns None when the vehicle reports no plug state.
+    """
+    port = vehicle_state.get(DESC_CHARGING_PORT_STATUS)
+    if port is not None and _is_plugged_in(port.value):
+        return _descriptor_timestamp(port)
+
+    plugged = vehicle_state.get(DESC_CHARGING_PORT_PLUGGED)
+    if plugged is not None and _is_plugged_in(plugged.value):
+        return _descriptor_timestamp(plugged)
+
+    return _descriptor_timestamp(vehicle_state.get(DESC_CHARGING_PORT_PLUG_EVENT))
+
+
+def _is_at_or_after(state: DescriptorState, reference: datetime | None) -> bool:
+    """Whether a reading was taken at or after a reference moment.
+
+    A reading or a reference without a usable timestamp gets the benefit of the
+    doubt, so vehicles that report neither keep the behaviour they had.
+    """
+    reported_at = _descriptor_timestamp(state)
+    if reference is None or reported_at is None:
+        return True
+    try:
+        return reported_at >= reference
+    except TypeError:
+        # Naive and aware timestamps mixed: keep the value rather than discard
+        # data we cannot compare.
+        return True
+
+
+def _belongs_to_plug_in(state: DescriptorState, vehicle_state: dict[str, DescriptorState]) -> bool:
+    """Whether a reading was taken since the cable went in."""
+    return _is_at_or_after(state, _plug_in_timestamp(vehicle_state))
+
+
+def _charge_start_timestamp(vehicle_state: dict[str, DescriptorState]) -> datetime | None:
+    """Return when the charge now running began, as reported by BMW.
+
+    Only a status that says the car is charging qualifies.  The timestamp on any
+    other status marks the end of the last charge rather than the start of one.
+    """
+    state = vehicle_state.get(DESC_CHARGING_STATUS)
+    if state is None:
+        return None
+    if str(state.value or "").strip().upper() not in SOCPredictor.CHARGING_ACTIVE_STATES:
+        return None
+    return _descriptor_timestamp(state)
+
+
+def _phase_count_reference(vehicle_state: dict[str, DescriptorState]) -> datetime | None:
+    """The moment a phase count has to be at or after to describe this charge.
+
+    BMW resets phaseNumber to '1-PHASES' when a charge ends and reports the real
+    count when the next charge starts.  It re-stamps the charge port as CONNECTED
+    at both of those moments even though the cable never moved, so the plug-in
+    cannot tell the two apart: the reset carries the same timestamp as the plug
+    state it would be compared against, and an equal timestamp reads as current.
+    The start of the charge now running is the line that separates them.
+
+    Vehicles that report no usable charging status timestamp fall back to the
+    plug-in, which is as much as is known about them.
+    """
+    return _charge_start_timestamp(vehicle_state) or _plug_in_timestamp(vehicle_state)
+
+
+def _describes_this_charge(state: DescriptorState, vehicle_state: dict[str, DescriptorState]) -> bool:
+    """Whether a stored phase count belongs to the charge now running.
+
+    A count stamped at or after the charge began plainly does. Vehicles that
+    send the count over the stream can stamp it a moment ahead of the status it
+    belongs to, and judging that one stale costs a poll asking BMW for what the
+    vehicle already reported, so a count above one is allowed a short lead. One
+    phase never is: that is what BMW leaves behind at the end of a charge, and
+    the two are indistinguishable.
+    """
+    reference = _phase_count_reference(vehicle_state)
+    if reference is None or _is_at_or_after(state, reference):
+        return True
+    phases = _descriptor_phases(state)
+    if phases is None or phases <= 1:
+        return False
+    return _is_at_or_after(state, reference - timedelta(seconds=PHASE_COUNT_LEAD_SECONDS))
+
+
+def _charge_phases(vehicle_state: dict[str, DescriptorState]) -> int | None:
+    """Return the phase count only when it describes the charge now running.
+
+    A count from before this charge began says nothing about it, and BMW leaves
+    one phase behind at the end of every charge.  Trusting that turns a 3-phase
+    charge into a 1-phase one and divides every derived power figure by three.
+    """
+    state = vehicle_state.get(DESC_CHARGING_PHASES)
+    if state is None or not _describes_this_charge(state, vehicle_state):
+        return None
+    return _descriptor_phases(state)
+
+
+def _carried_over_phases(vehicle_state: dict[str, DescriptorState]) -> int | None:
+    """Return a phase count left over from an earlier charge, when it says something.
+
+    BMW resets phaseNumber to '1-PHASES' when a charge ends, so a leftover of one
+    is indistinguishable from that reset and carries no information.  Anything
+    higher was reported while a real charge was running and is a better opening
+    guess than assuming a single phase.
+    """
+    state = vehicle_state.get(DESC_CHARGING_PHASES)
+    if state is None or _describes_this_charge(state, vehicle_state):
+        return None
+    phases = _descriptor_phases(state)
+    return phases if phases and phases > 1 else None
+
+
+def needs_phase_count_poll(vehicle_state: dict[str, DescriptorState]) -> bool:
+    """Whether the charge now running has no phase count to work from.
+
+    True means every power figure for this charge is being modelled on a single
+    phase because nothing better is known, which is worth an API call to settle
+    on the vehicles that only report the count when asked.
+    """
+    return _charge_phases(vehicle_state) is None
+
+
+def _charge_estimate_expired(vehicle_state: dict[str, DescriptorState]) -> bool:
+    """Whether BMW's own estimate of the time left in this charge has run out.
+
+    The estimate arrives only in an API poll, stamped with the moment it was
+    taken, so it expires that many minutes later. One from before this charge
+    began describes the charge before it and says nothing here.
+    """
+    state = vehicle_state.get(DESC_CHARGING_TIME_REMAINING)
+    started_at = _charge_start_timestamp(vehicle_state)
+    if state is None or started_at is None or not _is_at_or_after(state, started_at):
+        return False
+    minutes = _descriptor_float(state)
+    reported_at = _descriptor_timestamp(state)
+    if minutes is None or reported_at is None:
+        return False
+    try:
+        return datetime.now(UTC) >= reported_at + timedelta(minutes=minutes)
+    except TypeError:
+        # A naive timestamp cannot be compared against the clock, and a charge
+        # left running costs less than one ended on a guess.
+        return False
+
+
+def charge_should_have_ended(
+    soc_predictor: SOCPredictor,
+    vin: str,
+    vehicle_state: dict[str, DescriptorState],
+) -> bool:
+    """Whether this charge ought to be over, while BMW still calls it running.
+
+    BMW pushes the end of a charge over the stream when it feels like it, and on
+    some vehicles never, so a finished charge can leave the prediction climbing
+    on modelled power until the next scheduled poll, which may be hours away.
+    Two independent signs are worth an API call to settle: BMW's own estimate of
+    the time left has run out, or the prediction has reached the target and has
+    nothing left to add.
+    """
+    return _charge_estimate_expired(vehicle_state) or soc_predictor.prediction_reached_ceiling(vin)
+
+
+def _capacity_is_trusted(capacity_kwh: float, vehicle_state: dict[str, DescriptorState]) -> bool:
+    """Whether the battery capacity is fit to infer a phase count from.
+
+    The inferred count scales directly with capacity, so a figure BMW's own
+    contradicts cannot support one.  A manual figure with nothing to check it
+    against is still trusted: the whole prediction rests on it either way, and
+    the users who set one are usually the ones BMW reports nothing for.
+    """
+    for descriptor in (DESC_MAX_ENERGY, DESC_BATTERY_SIZE_MAX):
+        reported = _descriptor_float(vehicle_state.get(descriptor))
+        if reported and reported > 0:
+            return abs(capacity_kwh - reported) / reported <= _CAPACITY_TOLERANCE
+    return True
+
+
+def _has_ac_power_data(vehicle_state: dict[str, DescriptorState]) -> bool:
+    """Check if AC voltage x current data is available."""
+    voltage = _descriptor_float(vehicle_state.get(DESC_CHARGING_AC_VOLTAGE))
+    current = _descriptor_float(vehicle_state.get(DESC_CHARGING_AC_AMPERE))
+    return bool(voltage and current)
+
+
+def _parse_power_kw(value: Any, unit: str) -> float | None:
+    """Parse a power value to kW, converting from W if needed.
+
+    Returns None on parse failure.
+    """
+    try:
+        power_val = float(value)
+        return power_val / 1000.0 if unit.lower() == "w" else power_val
+    except (TypeError, ValueError):
+        return None
+
+
+def _reported_power_kw(vehicle_state: dict[str, DescriptorState]) -> float | None:
+    """Return BMW's own charging power reading in kW, if it reports one."""
+    state = vehicle_state.get(DESC_CHARGING_POWER)
+    if state is None or state.value is None:
+        return None
+    return _parse_power_kw(state.value, state.unit or "")
+
+
+def _plug_in_power_kw(vehicle_state: dict[str, DescriptorState]) -> float | None:
+    """Return BMW's charging power only when it belongs to the current plug-in.
+
+    Only such a reading may displace the voltage and current product.  A figure
+    left behind by the previous charge, a DC one above all, would otherwise be
+    taken for the power going in now.
+    """
+    state = vehicle_state.get(DESC_CHARGING_POWER)
+    if state is None or not _belongs_to_plug_in(state, vehicle_state):
+        return None
+    return _reported_power_kw(vehicle_state)
+
+
+def _apply_ac_power(
+    soc_predictor: SOCPredictor,
+    vin: str,
+    vehicle_state: dict[str, DescriptorState],
+) -> bool:
+    """Feed the predictor the best available power reading for an AC session.
+
+    Returns True when a reading was applied.
+    """
+    aux_kw = _get_aux_kw()
+    voltage = _descriptor_float(vehicle_state.get(DESC_CHARGING_AC_VOLTAGE))
+    current = _descriptor_float(vehicle_state.get(DESC_CHARGING_AC_AMPERE))
+    phases = _charge_phases(vehicle_state)
+
+    if voltage and current and phases is not None:
+        return soc_predictor.update_ac_charging_data(vin, voltage, current, phases, aux_kw)
+
+    power_kw = _plug_in_power_kw(vehicle_state)
+    if power_kw is not None and power_kw > 0:
+        soc_predictor.use_reported_power(vin, power_kw, voltage, current, aux_kw)
+        return True
+
+    if voltage and current:
+        soc_predictor.adopt_carried_over_phases(vin, _carried_over_phases(vehicle_state))
+        return soc_predictor.update_ac_charging_data(vin, voltage, current, None, aux_kw)
+
+    return False
+
+
+def _get_aux_kw() -> float:
+    """Get auxiliary power in kW (fixed override)."""
+    return float(_OVERRIDE_AUX_POWER)
+
+
+def _is_descriptor_fresh_for_session(
+    descriptor: DescriptorState,
+    session_anchor: datetime,
+) -> bool:
+    """Check if a descriptor's BMW timestamp is at or after the session anchor.
+
+    Uses the BMW-provided timestamp (not wall-clock last_seen) to detect
+    stale data from previous sessions that may arrive after HA restart.
+    After restart, last_seen is always current (set on receipt), but the
+    BMW timestamp reveals the data is actually hours old.
+    Falls back to last_seen if BMW timestamp is unavailable.
+    """
+    if descriptor.timestamp is not None:
+        try:
+            bmw_ts = datetime.fromisoformat(descriptor.timestamp)
+            return bmw_ts >= session_anchor
+        except (ValueError, TypeError):
+            pass
+    return descriptor.last_seen >= session_anchor.timestamp()
+
+
+def _resolve_bmw_soc(
+    vehicle_data: dict[str, DescriptorState],
+    session_anchor: datetime | None,
+) -> float | None:
+    """Resolve BMW SOC from charging.level, header, or stateOfCharge.displayed.
+
+    Priority: charging.level (during charging) > header > displayed (NK fallback).
+    When session_anchor is provided, sources are checked for freshness
+    to avoid stale data from before the session causing a false re-anchor.
+    """
+    cl = vehicle_data.get(DESC_CHARGING_LEVEL)
+    if cl and cl.value is not None and session_anchor is not None:
+        if _is_descriptor_fresh_for_session(cl, session_anchor):
+            try:
+                return float(cl.value)
+            except (TypeError, ValueError):
+                pass
+
+    for desc in (DESC_SOC_HEADER, DESC_SOC_DISPLAYED):
+        soc_state = vehicle_data.get(desc)
+        if soc_state and soc_state.value is not None:
+            try:
+                candidate = float(soc_state.value)
+                if session_anchor is not None and not _is_descriptor_fresh_for_session(soc_state, session_anchor):
+                    continue
+                return candidate
+            except (TypeError, ValueError):
+                pass
+
+    return None
+
+
+def get_predicted_soc(
+    soc_predictor: SOCPredictor,
+    vin: str,
+    vehicle_data: dict[str, DescriptorState] | None,
+) -> float | None:
+    """Get predicted SOC during charging, or BMW SOC when not charging.
+
+    Returns:
+        Predicted or actual SOC percentage (rounded to 1dp), or None if no data
+    """
+    if not vehicle_data:
+        return None
+
+    session = soc_predictor._sessions.get(vin) if soc_predictor.is_charging(vin) else None
+    anchor = session.anchor_timestamp if session is not None else None
+    bmw_soc = _resolve_bmw_soc(vehicle_data, anchor)
+
+    predicted = soc_predictor.get_predicted_soc(vin=vin, bmw_soc=bmw_soc)
+    if predicted is not None:
+        return round(predicted, 1)
+    return None
+
+
+def get_magic_soc(
+    soc_predictor: SOCPredictor,
+    magic_soc: MagicSOCPredictor,
+    vin: str,
+    vehicle_data: dict[str, DescriptorState] | None,
+) -> float | None:
+    """Get Magic SOC prediction for driving and charging.
+
+    During charging, delegates to SOCPredictor (energy-based).
+    During driving, delegates to MagicSOCPredictor (distance-based).
+    Otherwise, passes through BMW SOC.
+    """
+    if not vehicle_data:
+        return None
+
+    is_charging = soc_predictor.is_charging(vin)
+    session = None
+    if is_charging and not soc_predictor.is_phev(vin):
+        session = soc_predictor._sessions.get(vin)
+    anchor = session.anchor_timestamp if session is not None else None
+    bmw_soc = _resolve_bmw_soc(vehicle_data, anchor)
+    # Last-resort fallback to trip-end hvSoc. Normally dead code since
+    # _resolve_bmw_soc now covers stateOfCharge.displayed (NK vehicles).
+    # Kept as safety net for unknown models missing both header and displayed.
+    if bmw_soc is None and not is_charging:
+        hvsoc_state = vehicle_data.get(DESC_TRIP_HVSOC)
+        if hvsoc_state and hvsoc_state.value is not None:
+            try:
+                bmw_soc = float(hvsoc_state.value)
+            except (TypeError, ValueError):
+                pass
+
+    if is_charging:
+        predicted = soc_predictor.get_predicted_soc(vin=vin, bmw_soc=bmw_soc)
+        if predicted is not None:
+            magic_soc.set_last_magic_soc(vin, predicted)
+        return predicted
+
+    mileage_state = vehicle_data.get(DESC_TRAVELLED_DISTANCE)
+    mileage = None
+    if mileage_state and mileage_state.value is not None:
+        try:
+            mileage = float(mileage_state.value)
+        except (TypeError, ValueError):
+            pass
+
+    return magic_soc.get_magic_soc(vin=vin, bmw_soc=bmw_soc, mileage=mileage)
+
+
+def get_magic_soc_attributes(
+    soc_predictor: SOCPredictor,
+    magic_soc: MagicSOCPredictor,
+    vin: str,
+    vehicle_data: dict[str, DescriptorState] | None = None,
+) -> dict[str, Any]:
+    """Get extra state attributes for the Magic SOC sensor."""
+    attrs = magic_soc.get_magic_soc_attributes(vin)
+    if soc_predictor.is_charging(vin):
+        attrs["prediction_mode"] = "charging"
+    elif (
+        vehicle_data is not None
+        and attrs.get("prediction_mode") == "passthrough"
+        and _descriptor_float(vehicle_data.get(DESC_SOC_HEADER)) is None
+        and _descriptor_float(vehicle_data.get(DESC_SOC_DISPLAYED)) is None
+        and _descriptor_float(vehicle_data.get(DESC_TRIP_HVSOC)) is not None
+    ):
+        attrs["prediction_mode"] = "fallback (trip-end SOC, may be stale after charging)"
+    return attrs
+
+
+def anchor_soc_session(
+    soc_predictor: SOCPredictor,
+    magic_soc: MagicSOCPredictor,
+    vin: str,
+    vehicle_state: dict[str, DescriptorState],
+    manual_capacity: float | None,
+) -> None:
+    """Anchor SOC prediction session when charging starts.
+
+    Must be called while holding _lock.
+    """
+    current_soc: float | None = None
+    for desc in (DESC_SOC_HEADER, DESC_SOC_DISPLAYED):
+        soc_state = vehicle_state.get(desc)
+        if soc_state and soc_state.value is not None:
+            try:
+                current_soc = float(soc_state.value)
+                break
+            except (TypeError, ValueError):
+                pass
+
+    if current_soc is None:
+        current_soc = soc_predictor._last_predicted_soc.get(vin)
+        if current_soc is not None:
+            _LOGGER.debug(
+                "Anchor fallback for %s: using last predicted SOC %.1f%%",
+                redact_vin(vin),
+                current_soc,
+            )
+
+    if current_soc is None:
+        _LOGGER.debug("Cannot anchor session for %s: no SOC data available", redact_vin(vin))
+        return
+
+    capacity_kwh: float | None = None
+
+    if manual_capacity is not None and manual_capacity > 0:
+        capacity_kwh = manual_capacity
+        _LOGGER.debug(
+            "Using manual battery capacity for %s: %.1f kWh",
+            redact_vin(vin),
+            capacity_kwh,
+        )
+
+    if capacity_kwh is None or capacity_kwh <= 0:
+        capacity_state = vehicle_state.get(DESC_MAX_ENERGY)
+        capacity_kwh = _descriptor_float(capacity_state)
+
+    if capacity_kwh is None or capacity_kwh <= 0:
+        capacity_state = vehicle_state.get(DESC_BATTERY_SIZE_MAX)
+        capacity_kwh = _descriptor_float(capacity_state)
+
+    if capacity_kwh is None or capacity_kwh <= 0:
+        existing_session = soc_predictor._sessions.get(vin)
+        if existing_session and existing_session.battery_capacity_kwh > 0:
+            capacity_kwh = existing_session.battery_capacity_kwh
+            _LOGGER.debug(
+                "Anchor fallback for %s: using existing session capacity %.1f kWh",
+                redact_vin(vin),
+                capacity_kwh,
+            )
+
+    if capacity_kwh is None or capacity_kwh <= 0:
+        _LOGGER.debug("Cannot anchor session for %s: no capacity data available", redact_vin(vin))
+        return
+
+    target_soc: float | None = None
+    target_state = vehicle_state.get("vehicle.powertrain.electric.battery.stateOfCharge.target")
+    if target_state and target_state.value is not None:
+        try:
+            target_soc = float(target_state.value)
+        except (TypeError, ValueError):
+            pass
+
+    magic_soc.update_battery_capacity(vin, capacity_kwh)
+    charging_method = soc_predictor.get_charging_method(vin) or "AC"
+    soc_predictor.anchor_session(vin, current_soc, capacity_kwh, charging_method, target_soc=target_soc)
+
+    session = soc_predictor._sessions.get(vin)
+    if session is not None:
+        session.capacity_trusted = _capacity_is_trusted(capacity_kwh, vehicle_state)
+
+    _seed_power_after_anchor(soc_predictor, vin, vehicle_state, charging_method)
+
+
+def _seed_power_after_anchor(
+    soc_predictor: SOCPredictor,
+    vin: str,
+    vehicle_state: dict[str, DescriptorState],
+    charging_method: str,
+) -> None:
+    """Seed session with current power reading after anchoring."""
+    if charging_method == "DC":
+        power_kw = _reported_power_kw(vehicle_state)
+        if power_kw is not None:
+            soc_predictor.update_power_reading(vin, power_kw, aux_power_kw=_get_aux_kw())
+    else:
+        _apply_ac_power(soc_predictor, vin, vehicle_state)
+
+
+def end_soc_session(
+    soc_predictor: SOCPredictor,
+    vin: str,
+    vehicle_state: dict[str, DescriptorState],
+    last_predicted_soc_sent: dict[str, float],
+) -> None:
+    """End SOC prediction session when charging stops.
+
+    Must be called while holding _lock.
+    """
+    soc_state = vehicle_state.get(DESC_SOC_HEADER)
+    current_soc = None
+    if soc_state and soc_state.value is not None:
+        try:
+            current_soc = float(soc_state.value)
+        except (TypeError, ValueError):
+            pass
+
+    target_state = vehicle_state.get("vehicle.powertrain.electric.battery.stateOfCharge.target")
+    target_soc = None
+    if target_state and target_state.value is not None:
+        try:
+            target_soc = float(target_state.value)
+        except (TypeError, ValueError):
+            pass
+
+    if current_soc is None:
+        current_soc = soc_predictor._last_predicted_soc.get(vin)
+    if current_soc is not None:
+        soc_predictor.end_session(vin, current_soc, target_soc)
+
+    last_predicted_soc_sent.pop(vin, None)
+
+
+def anchor_driving_session(
+    magic_soc: MagicSOCPredictor,
+    soc_predictor: SOCPredictor,
+    vin: str,
+    vehicle_state: dict[str, DescriptorState],
+    manual_capacity: float | None,
+) -> None:
+    """Anchor a driving session when trip starts.
+
+    Must be called while holding _lock.
+    Falls back to cached SOC/capacity when descriptors have been evicted.
+    """
+    if magic_soc.is_phev(vin):
+        _LOGGER.debug("Magic SOC: Skipping anchor for %s (PHEV)", redact_vin(vin))
+        return
+
+    if soc_predictor.is_charging(vin):
+        _LOGGER.debug("Magic SOC: Skipping anchor for %s (charging active)", redact_vin(vin))
+        return
+
+    current_soc: float | None = None
+    for desc in (DESC_SOC_HEADER, DESC_SOC_DISPLAYED):
+        soc_state = vehicle_state.get(desc)
+        if soc_state and soc_state.value is not None:
+            try:
+                current_soc = float(soc_state.value)
+                break
+            except (TypeError, ValueError):
+                pass
+    if current_soc is None:
+        current_soc = magic_soc.get_last_known_soc(vin)
+        if current_soc is None:
+            _LOGGER.debug("Magic SOC: Cannot anchor %s — no SOC available (live or cached)", redact_vin(vin))
+            return
+        _LOGGER.debug(
+            "Magic SOC: Using cached SOC %.1f%% for %s (descriptor unavailable)",
+            current_soc,
+            redact_vin(vin),
+        )
+
+    mileage_state = vehicle_state.get(DESC_TRAVELLED_DISTANCE)
+    if not mileage_state or mileage_state.value is None:
+        _LOGGER.debug("Magic SOC: Cannot anchor %s — no mileage in vehicle_state", redact_vin(vin))
+        return
+    try:
+        current_mileage = float(mileage_state.value)
+    except (TypeError, ValueError):
+        return
+
+    capacity_kwh: float | None = None
+
+    if manual_capacity is not None and manual_capacity > 0:
+        capacity_kwh = manual_capacity
+        _LOGGER.debug(
+            "Soc prediction: Using manual battery capacity for %s: %.1f kWh",
+            redact_vin(vin),
+            capacity_kwh,
+        )
+
+    if capacity_kwh is None or capacity_kwh <= 0:
+        capacity_state = vehicle_state.get(DESC_MAX_ENERGY)
+        capacity_kwh = _descriptor_float(capacity_state)
+    if capacity_kwh is None or capacity_kwh <= 0:
+        capacity_state = vehicle_state.get(DESC_BATTERY_SIZE_MAX)
+        capacity_kwh = _descriptor_float(capacity_state)
+
+    if capacity_kwh is not None and capacity_kwh > 0:
+        magic_soc.update_battery_capacity(vin, capacity_kwh)
+    else:
+        capacity_kwh = magic_soc.get_last_known_capacity(vin)
+        if capacity_kwh is None or capacity_kwh <= 0:
+            capacity_kwh = magic_soc.get_default_capacity(vin)
+            if capacity_kwh is None or capacity_kwh <= 0:
+                _LOGGER.debug(
+                    "Magic SOC: Cannot anchor %s — no capacity available (live, cached, or model default)",
+                    redact_vin(vin),
+                )
+                return
+            _LOGGER.debug(
+                "Magic SOC: Using model default capacity %.1f kWh for %s",
+                capacity_kwh,
+                redact_vin(vin),
+            )
+        else:
+            _LOGGER.debug(
+                "Magic SOC: Using cached capacity %.1f kWh for %s (descriptor unavailable)",
+                capacity_kwh,
+                redact_vin(vin),
+            )
+
+    magic_soc.anchor_driving_session(vin, current_soc, current_mileage, capacity_kwh)
+
+
+def end_driving_session(
+    magic_soc: MagicSOCPredictor,
+    vin: str,
+    vehicle_state: dict[str, DescriptorState],
+) -> None:
+    """End a driving session when trip ends.
+
+    Must be called while holding _lock.
+    """
+    end_soc = None
+    for desc in (DESC_SOC_HEADER, DESC_SOC_DISPLAYED):
+        soc_state = vehicle_state.get(desc)
+        if soc_state and soc_state.value is not None:
+            try:
+                end_soc = float(soc_state.value)
+                break
+            except (TypeError, ValueError):
+                pass
+
+    mileage_state = vehicle_state.get(DESC_TRAVELLED_DISTANCE)
+    end_mileage = None
+    if mileage_state and mileage_state.value is not None:
+        try:
+            end_mileage = float(mileage_state.value)
+        except (TypeError, ValueError):
+            pass
+
+    magic_soc.end_driving_session(vin, end_soc, end_mileage)
+
+
+def process_soc_descriptors(
+    coordinator: CardataCoordinator,
+    vin: str,
+    data: dict[str, Any],
+    vehicle_state: dict[str, DescriptorState],
+) -> bool:
+    """Process all SOC-related descriptors from a message.
+
+    Handles charging status/method/power, BMW SOC tracking, mileage wiring,
+    door state, capacity late-anchor, PHEV detection, isMoving transitions,
+    and sensor creation signals.
+
+    Returns True if debounced update should be scheduled.
+    """
+    soc_predictor = coordinator._soc_predictor
+    magic_soc_pred = coordinator._magic_soc
+    pending = coordinator._pending_manager
+    schedule_debounce = False
+
+    for descriptor, descriptor_payload in data.items():
+        if not isinstance(descriptor_payload, dict):
+            continue
+        value = descriptor_payload.get("value")
+
+        if descriptor == DESC_CHARGING_STATUS:
+            was_charging = soc_predictor.is_charging(vin)
+            status_changed = soc_predictor.update_charging_status(vin, str(value) if value else None)
+            if status_changed:
+                coordinator._motion_detector.set_charging(vin, soc_predictor.is_charging(vin))
+                manual_cap = coordinator.get_manual_battery_capacity(vin)
+                if soc_predictor.is_charging(vin):
+                    anchor_soc_session(soc_predictor, magic_soc_pred, vin, vehicle_state, manual_cap)
+                    end_driving_session(magic_soc_pred, vin, vehicle_state)
+                    coordinator.schedule_phase_count_poll(vin)
+                    coordinator._charge_end_poll_asked.discard(vin)
+                elif was_charging:
+                    end_soc_session(soc_predictor, vin, vehicle_state, coordinator._last_predicted_soc_sent)
+                    runtime = coordinator.hass.data.get(DOMAIN, {}).get(coordinator.entry_id)
+                    if runtime is not None:
+                        runtime.request_trip_poll(vin, force=True)
+                        _LOGGER.debug(
+                            "Charging ended for VIN %s, requesting API poll for SOC verification",
+                            redact_vin(vin),
+                        )
+                if magic_soc_pred.has_signaled_magic_soc_entity(vin):
+                    if pending.add_update(vin, MAGIC_SOC_DESCRIPTOR):
+                        schedule_debounce = True
+
+        elif descriptor == "vehicle.drivetrain.electricEngine.charging.method":
+            if value:
+                soc_predictor.set_charging_method(vin, str(value))
+
+        elif descriptor == DESC_CHARGING_POWER:
+            method = soc_predictor.get_charging_method(vin)
+            applied = False
+            if method == "DC":
+                power_kw = _parse_power_kw(value, descriptor_payload.get("unit") or "") if value is not None else None
+                soc_predictor.update_power_reading(vin, power_kw, aux_power_kw=_get_aux_kw())
+                applied = True
+            elif method is not None:
+                # Same choice between the two sources as everywhere else, rather
+                # than a second copy that would feed a reported zero straight in.
+                applied = _apply_ac_power(soc_predictor, vin, vehicle_state)
+            if applied:
+                if soc_predictor.is_charging(vin):
+                    if soc_predictor.has_signaled_entity(vin):
+                        if pending.add_update(vin, PREDICTED_SOC_DESCRIPTOR):
+                            schedule_debounce = True
+                    if magic_soc_pred.has_signaled_magic_soc_entity(vin):
+                        if pending.add_update(vin, MAGIC_SOC_DESCRIPTOR):
+                            schedule_debounce = True
+
+        elif descriptor in (
+            DESC_CHARGING_AC_AMPERE,
+            DESC_CHARGING_AC_VOLTAGE,
+            DESC_CHARGING_PHASES,
+        ):
+            if soc_predictor.is_charging(vin) and soc_predictor.get_charging_method(vin) != "DC":
+                if _apply_ac_power(soc_predictor, vin, vehicle_state):
+                    if soc_predictor.has_signaled_entity(vin):
+                        if pending.add_update(vin, PREDICTED_SOC_DESCRIPTOR):
+                            schedule_debounce = True
+                    if magic_soc_pred.has_signaled_magic_soc_entity(vin):
+                        if pending.add_update(vin, MAGIC_SOC_DESCRIPTOR):
+                            schedule_debounce = True
+
+        elif descriptor in (DESC_SOC_HEADER, DESC_SOC_DISPLAYED):
+            if value is not None:
+                try:
+                    soc_val = float(value)
+                    skip_stale = False
+                    if soc_predictor.is_charging(vin):
+                        session = soc_predictor._sessions.get(vin)
+                        if session is not None:
+                            # Skip when BMW timestamp is from before
+                            # the current session (prevents stale data after restart)
+                            desc_state = vehicle_state.get(descriptor)
+                            if desc_state is not None and not _is_descriptor_fresh_for_session(
+                                desc_state,
+                                session.anchor_timestamp,
+                            ):
+                                skip_stale = True
+                            # PHEV: skip header sync-down when charging.level is fresh.
+                            # Stale header (frozen at pre-charge value) is always below
+                            # prediction — blocking sync-down catches it.  Fresh header
+                            # above prediction is a legitimate mid-charge update and must
+                            # be allowed through for re-anchoring.
+                            if not skip_stale and soc_predictor.is_phev(vin):
+                                cl = vehicle_state.get(DESC_CHARGING_LEVEL)
+                                if (
+                                    cl is not None
+                                    and cl.value is not None
+                                    and _is_descriptor_fresh_for_session(
+                                        cl,
+                                        session.anchor_timestamp,
+                                    )
+                                ):
+                                    current_predicted = soc_predictor._last_predicted_soc.get(vin)
+                                    if current_predicted is not None and soc_val < current_predicted:
+                                        skip_stale = True
+                    if not skip_stale:
+                        # Judge the phase count on the real battery reading only.
+                        # The displayed SOC can sit on a different scale, and
+                        # charging.level is BMW predicting rather than measuring;
+                        # mixing them turns a constant offset into free gain.
+                        if descriptor == DESC_SOC_HEADER:
+                            soc_predictor.update_phase_inference(vin, soc_val)
+                        soc_predictor.update_bmw_soc(vin, soc_val)
+                        magic_soc_pred.update_bmw_soc(vin, soc_val)
+                    if soc_predictor.is_charging(vin) and not soc_predictor.has_active_session(vin):
+                        _LOGGER.debug(
+                            "Late anchor attempt for %s (SOC arrived after charging started)",
+                            redact_vin(vin),
+                        )
+                        manual_cap = coordinator.get_manual_battery_capacity(vin)
+                        anchor_soc_session(soc_predictor, magic_soc_pred, vin, vehicle_state, manual_cap)
+                    if soc_predictor.has_signaled_entity(vin):
+                        if pending.add_update(vin, PREDICTED_SOC_DESCRIPTOR):
+                            schedule_debounce = True
+                    if vin in magic_soc_pred._driving_sessions:
+                        mileage_state = vehicle_state.get(DESC_TRAVELLED_DISTANCE)
+                        if mileage_state and mileage_state.value is not None:
+                            try:
+                                current_mileage = float(mileage_state.value)
+                                magic_soc_pred.reanchor_driving_session(vin, soc_val, current_mileage)
+                            except (TypeError, ValueError):
+                                pass
+                    else:
+                        bmw_moving = coordinator._last_bmw_is_moving.get(vin)
+                        gps_moving = coordinator._last_derived_is_moving.get(vin)
+                        if bmw_moving is True or gps_moving is True:
+                            manual_cap = coordinator.get_manual_battery_capacity(vin)
+                            anchor_driving_session(magic_soc_pred, soc_predictor, vin, vehicle_state, manual_cap)
+                    if magic_soc_pred.has_signaled_magic_soc_entity(vin):
+                        if pending.add_update(vin, MAGIC_SOC_DESCRIPTOR):
+                            schedule_debounce = True
+                except (TypeError, ValueError):
+                    pass
+
+        elif descriptor == DESC_CHARGING_LEVEL:
+            if value is not None and soc_predictor.is_charging(vin):
+                # Check BMW timestamp freshness to avoid stale data
+                # from previous sessions arriving after HA restart
+                session = soc_predictor._sessions.get(vin)
+                cl_state = vehicle_state.get(DESC_CHARGING_LEVEL)
+                skip_stale_level = (
+                    session is not None
+                    and cl_state is not None
+                    and not _is_descriptor_fresh_for_session(
+                        cl_state,
+                        session.anchor_timestamp,
+                    )
+                )
+                if not skip_stale_level:
+                    try:
+                        level_val = float(value)
+                        soc_predictor.update_bmw_soc(vin, level_val, from_charging_level=True)
+                        if not soc_predictor.has_active_session(vin):
+                            _LOGGER.debug(
+                                "Late anchor attempt for %s (charging.level arrived after charging started)",
+                                redact_vin(vin),
+                            )
+                            manual_cap = coordinator.get_manual_battery_capacity(vin)
+                            anchor_soc_session(soc_predictor, magic_soc_pred, vin, vehicle_state, manual_cap)
+                        if soc_predictor.has_signaled_entity(vin):
+                            if pending.add_update(vin, PREDICTED_SOC_DESCRIPTOR):
+                                schedule_debounce = True
+                        if magic_soc_pred.has_signaled_magic_soc_entity(vin):
+                            if pending.add_update(vin, MAGIC_SOC_DESCRIPTOR):
+                                schedule_debounce = True
+                    except (TypeError, ValueError):
+                        pass
+
+        elif descriptor == DESC_TRIP_HVSOC:
+            # Last-resort fallback. Normally dead code since header or displayed
+            # covers all known vehicles. Kept as safety net for unknown models.
+            # Only populates the Magic SOC cache — no charging prediction,
+            # no re-anchoring, no late-anchor (hvSoc is historical trip-end data).
+            if value is not None:
+                header_state = vehicle_state.get(DESC_SOC_HEADER)
+                displayed_state = vehicle_state.get(DESC_SOC_DISPLAYED)
+                has_live_soc = (header_state is not None and header_state.value is not None) or (
+                    displayed_state is not None and displayed_state.value is not None
+                )
+                if not has_live_soc:
+                    try:
+                        hvsoc_val = float(value)
+                        magic_soc_pred.update_bmw_soc(vin, hvsoc_val)
+                        _LOGGER.debug(
+                            "Trip-end hvSoc fallback: %.1f%% for %s (may be stale after charging)",
+                            hvsoc_val,
+                            redact_vin(vin),
+                        )
+                        if magic_soc_pred.has_signaled_magic_soc_entity(vin):
+                            if pending.add_update(vin, MAGIC_SOC_DESCRIPTOR):
+                                schedule_debounce = True
+                    except (TypeError, ValueError):
+                        pass
+
+        elif descriptor == DESC_TRAVELLED_DISTANCE:
+            if value is not None:
+                try:
+                    mileage = float(value)
+                    coordinator._motion_detector.update_mileage(vin, mileage)
+                    needs_anchor = magic_soc_pred.update_driving_mileage(vin, mileage)
+                    if needs_anchor or vin not in magic_soc_pred._driving_sessions:
+                        # Use CACHED isMoving state (not live) to avoid orphaned sessions.
+                        # Live is_moving() can transiently return True via mileage fallback
+                        # then immediately revert when GPS/door-lock arrives in the same batch,
+                        # creating a session that isMoving tracking never sees and can't clean up.
+                        bmw_moving = coordinator._last_bmw_is_moving.get(vin)
+                        gps_moving = coordinator._last_derived_is_moving.get(vin)
+                        if bmw_moving is True or gps_moving is True:
+                            manual_cap = coordinator.get_manual_battery_capacity(vin)
+                            anchor_driving_session(magic_soc_pred, soc_predictor, vin, vehicle_state, manual_cap)
+                        elif needs_anchor:
+                            # Mileage increased but car not in driving mode.
+                            # Likely a completed trip whose data arrived post-trip
+                            # (door already unlocked). Acknowledge the mileage so
+                            # it doesn't inflate the next trip's baseline distance.
+                            magic_soc_pred._last_reported_mileage[vin] = mileage
+                    if magic_soc_pred.has_signaled_magic_soc_entity(vin):
+                        if pending.add_update(vin, MAGIC_SOC_DESCRIPTOR):
+                            schedule_debounce = True
+                except (TypeError, ValueError):
+                    pass
+
+        elif descriptor == "vehicle.cabin.door.status":
+            if value is not None:
+                coordinator._motion_detector.update_door_lock_state(vin, str(value))
+
+        elif descriptor in (
+            DESC_BATTERY_SIZE_MAX,
+            DESC_MAX_ENERGY,
+        ):
+            if soc_predictor.is_charging(vin) and not soc_predictor.has_active_session(vin):
+                _LOGGER.debug(
+                    "Late anchor attempt for %s (capacity arrived after charging started)",
+                    redact_vin(vin),
+                )
+                manual_cap = coordinator.get_manual_battery_capacity(vin)
+                anchor_soc_session(soc_predictor, magic_soc_pred, vin, vehicle_state, manual_cap)
+
+    # Check if predicted_soc sensor should be created
+    if DESC_SOC_HEADER in vehicle_state or DESC_SOC_DISPLAYED in vehicle_state:
+        if PREDICTED_SOC_DESCRIPTOR not in vehicle_state:
+            if pending.add_new_sensor(vin, PREDICTED_SOC_DESCRIPTOR):
+                schedule_debounce = True
+
+    # Detect PHEV
+    has_hv_battery = DESC_SOC_HEADER in vehicle_state or DESC_SOC_DISPLAYED in vehicle_state
+    has_fuel_system = DESC_REMAINING_FUEL in vehicle_state or DESC_FUEL_LEVEL in vehicle_state
+    if has_hv_battery:
+        is_phev = has_fuel_system and not coordinator._is_metadata_bev(vin)
+        soc_predictor.set_vehicle_is_phev(vin, is_phev)
+        magic_soc_pred.set_vehicle_is_phev(vin, is_phev)
+
+        if not is_phev and coordinator.enable_magic_soc and MAGIC_SOC_DESCRIPTOR not in vehicle_state:
+            if pending.add_new_sensor(vin, MAGIC_SOC_DESCRIPTOR):
+                schedule_debounce = True
+
+    # Detect BMW-provided vehicle.isMoving transitions
+    if "vehicle.isMoving" in data:
+        is_moving_payload = data["vehicle.isMoving"]
+        if isinstance(is_moving_payload, dict):
+            from .message_utils import normalize_boolean_value
+
+            new_is_moving = normalize_boolean_value("vehicle.isMoving", is_moving_payload.get("value"))
+            last_bmw_moving = coordinator._last_bmw_is_moving.get(vin)
+            if last_bmw_moving is True and new_is_moving is False:
+                runtime = coordinator.hass.data.get(DOMAIN, {}).get(coordinator.entry_id)
+                if runtime is not None:
+                    runtime.request_trip_poll(vin)
+                end_driving_session(magic_soc_pred, vin, vehicle_state)
+                if magic_soc_pred.has_signaled_magic_soc_entity(vin):
+                    if pending.add_update(vin, MAGIC_SOC_DESCRIPTOR):
+                        schedule_debounce = True
+            elif last_bmw_moving is not True and new_is_moving is True:
+                manual_cap = coordinator.get_manual_battery_capacity(vin)
+                anchor_driving_session(magic_soc_pred, soc_predictor, vin, vehicle_state, manual_cap)
+                if magic_soc_pred.has_signaled_magic_soc_entity(vin):
+                    if pending.add_update(vin, MAGIC_SOC_DESCRIPTOR):
+                        schedule_debounce = True
+            if new_is_moving is not None:
+                coordinator._last_bmw_is_moving[vin] = new_is_moving
+
+    return schedule_debounce

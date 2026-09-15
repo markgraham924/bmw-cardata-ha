@@ -1,3 +1,28 @@
+# Copyright (c) 2025, Renaud Allard <renaud@allard.it>, Kris Van Biesen <kvanbiesen@gmail.com>, Jyri Saukkonen <jyri.saukkonen+jjyksi@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
 """Handle BMW CarData MQTT streaming."""
 
 from __future__ import annotations
@@ -6,21 +31,47 @@ import asyncio
 import json
 import logging
 import ssl
+import threading
 import time
-from typing import Awaitable, Callable, Optional
+from collections.abc import Awaitable, Callable, Coroutine
+from concurrent.futures import Future as ConcurrentFuture
+from enum import Enum
+from typing import Any, cast
 
 import paho.mqtt.client as mqtt
-
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from . import stream_reconnect
+from .const import LOCK_ACQUIRE_TIMEOUT
 from .debug import debug_enabled
+from .stream_circuit_breaker import CircuitBreaker
+from .utils import redact_vin_in_text, redact_vin_payload
 
 _LOGGER = logging.getLogger(__name__)
+
+# Global lock to serialize MQTT connection attempts across all entries
+# This prevents multiple accounts from connecting simultaneously, which can cause:
+# - Thread pool contention
+# - BMW server-side throttling
+# - Race conditions in network handling
+_GLOBAL_MQTT_CONNECT_LOCK = asyncio.Lock()
+
+
+class ConnectionState(Enum):
+    """MQTT connection states."""
+
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    DISCONNECTING = "disconnecting"
+    FAILED = "failed"
 
 
 class CardataStreamManager:
     """Manage the MQTT connection to BMW CarData."""
+
+    # Prevent endless auth hammering on misconfigured custom broker credentials.
+    _CUSTOM_BROKER_MAX_AUTH_RETRIES = 6
 
     def __init__(
         self,
@@ -32,39 +83,193 @@ class CardataStreamManager:
         host: str,
         port: int,
         keepalive: int,
-        error_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+        error_callback: Callable[[str], Awaitable[None]] | None = None,
+        entry_id: str | None = None,
+        custom_broker: bool = False,
+        custom_mqtt_username: str | None = None,
+        custom_mqtt_password: str | None = None,
+        custom_mqtt_tls: str = "off",
+        custom_mqtt_topic_prefix: str = "bmw/",
     ) -> None:
         self.hass = hass
+        self._entry_id = entry_id
         self._client_id = client_id
         self._gcid = gcid
         self._password = id_token
         self._host = host
         self._port = port
         self._keepalive = keepalive
-        self._client: Optional[mqtt.Client] = None
-        self._message_callback: Optional[Callable[[dict], Awaitable[None]]] = None
+        self._client: mqtt.Client | None = None
+        self._message_callback: Callable[[dict], Awaitable[None]] | None = None
         self._error_callback = error_callback
         self._reauth_notified = False
         self._unauthorized_retry_in_progress = False
+        # Custom MQTT broker settings
+        self._custom_broker = custom_broker
+        self._custom_mqtt_username = custom_mqtt_username
+        self._custom_mqtt_password = custom_mqtt_password
+        self._custom_mqtt_tls = custom_mqtt_tls  # "off", "tls", "tls_insecure"
+        self._custom_mqtt_topic_prefix = custom_mqtt_topic_prefix
+        # Protects _unauthorized_retry_in_progress
+        self._unauthorized_lock = asyncio.Lock()
         self._awaiting_new_credentials = False
-        self._status_callback: Optional[
-            Callable[[str, Optional[str]], Awaitable[None]]
-        ] = None
+        self._status_callback: Callable[[str, str | None], Awaitable[None]] | None = None
         self._reconnect_backoff = 5
         self._max_backoff = 300
-        self._last_disconnect: Optional[float] = None
-        self._disconnect_future: Optional[asyncio.Future[None]] = None
+        self._last_disconnect: float | None = None
+        self._disconnect_future: asyncio.Future[None] | None = None
         self._retry_backoff = 3
-        self._retry_task: Optional[asyncio.Task] = None
+        self._retry_task: asyncio.Task | None = None
         self._min_reconnect_interval = 10.0
         self._connect_lock = asyncio.Lock()
+        # Serialize credential updates and reconnects
+        self._credential_lock = asyncio.Lock()
+        self._connection_state = ConnectionState.DISCONNECTED
+        self._intentional_disconnect = False
+        # Circuit breaker for runaway reconnections
+        self._circuit_breaker = CircuitBreaker(on_persist=self._persist_circuit_breaker_state)
+        # Reconnect attempt tracking for extended backoff
+        self._consecutive_reconnect_failures = 0
+        self._extended_backoff_threshold = 10  # After this many failures, use extended backoff
+        self._extended_backoff = 600  # 10 minutes extended backoff (reduced from 30 min)
+        self._custom_auth_failures = 0
+        self._custom_auth_retry_blocked = False
+        # Flag to prevent MQTT start during bootstrap
+        self._bootstrap_in_progress: bool = False
+        # Event signaled when bootstrap completes (for efficient waiting)
+        self._bootstrap_complete_event: asyncio.Event = asyncio.Event()
+        # Connection timeout for MQTT
+        self._connect_timeout = 20.0
+        # Threading event for connection synchronization (avoids global socket timeout)
+        self._connect_event: threading.Event | None = None
+        self._connect_rc: int | None = None
+        # Circuit breaker persistence serialization
+        self._persist_lock = asyncio.Lock()
+
+    def _run_coro_safe(self, coro: Coroutine[Any, Any, Any]) -> None:
+        """Run coroutine from MQTT callback thread with exception logging.
+
+        This ensures exceptions in async callbacks are logged instead of silently lost.
+        """
+
+        def _done_callback(future: ConcurrentFuture[Any]) -> None:
+            try:
+                future.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as err:
+                _LOGGER.exception("Exception in MQTT async callback: %s", err)
+
+        future = asyncio.run_coroutine_threadsafe(coro, self.hass.loop)
+        future.add_done_callback(_done_callback)
+
+    def _safe_loop_stop(self, client: mqtt.Client) -> None:
+        """Safely stop the MQTT loop, handling any exceptions.
+
+        This ensures cleanup continues even if loop_stop() fails, preventing
+        resource leaks from zombie MQTT threads.
+        """
+        try:
+            client.loop_stop()
+        except Exception as err:
+            _LOGGER.warning("Error stopping MQTT loop: %s", err)
 
     async def async_start(self) -> None:
-        async with self._connect_lock:
+        # Acquire lock with timeout to prevent indefinite blocking
+        try:
+            await asyncio.wait_for(self._connect_lock.acquire(), timeout=LOCK_ACQUIRE_TIMEOUT)
+        except TimeoutError:
+            _LOGGER.debug("Connect lock held for >60s; connection attempt already in progress")
+            # Trigger status update in case we're already connected but status wasn't propagated
+            if self._status_callback and self._connection_state == ConnectionState.CONNECTED:
+                await self._status_callback("connected", None)
+            return
+
+        try:
             await self._async_start_locked()
+        finally:
+            self._connect_lock.release()
+
+    def get_circuit_breaker_state(self) -> dict:
+        """Get circuit breaker state for persistence."""
+        return self._circuit_breaker.get_state()
+
+    def restore_circuit_breaker_state(self, state: dict) -> None:
+        """Restore circuit breaker state from persistence."""
+        self._circuit_breaker.restore_state(state)
+
+    def _persist_circuit_breaker_state(self) -> None:
+        """Persist circuit breaker state to config entry.
+
+        Uses a pending flag to coalesce rapid state changes and avoid race conditions.
+        Only the latest state will be persisted.
+        """
+        if not self._entry_id:
+            return
+        # Schedule persistence in event loop (called from sync context)
+        # The async helper will get the latest state when it actually runs
+        self._run_coro_safe(self._async_persist_circuit_breaker())
+
+    async def _async_persist_circuit_breaker(self) -> None:
+        """Async helper to persist circuit breaker state.
+
+        Uses a lock to serialize persistence. Concurrent callers wait for
+        lock and then persist the latest state, ensuring no updates are lost.
+        """
+        from .runtime import async_update_entry_data
+
+        async with self._persist_lock:
+            # Get the latest state while holding the lock
+            state = self.get_circuit_breaker_state()
+
+            entry = self.hass.config_entries.async_get_entry(self._entry_id) if self._entry_id else None
+            if entry:
+                await async_update_entry_data(self.hass, entry, {"circuit_breaker_state": state})
 
     async def _async_start_locked(self) -> None:
+        # CRITICAL: Don't start MQTT if bootstrap is still in progress
+        # Blocks reconnects, retries, and credential updates until bootstrap finishes
+        if getattr(self, "_bootstrap_in_progress", False):
+            _LOGGER.debug(
+                "Skipping MQTT start - bootstrap still fetching vehicle metadata. "
+                "MQTT will start automatically when bootstrap completes."
+            )
+            # Update status so users know why MQTT isn't connected
+            if self._status_callback:
+                self._run_coro_safe(
+                    cast(Coroutine[Any, Any, None], self._status_callback("waiting_for_bootstrap", None))
+                )
+            return
+
+        # Check circuit breaker
+        if self._circuit_breaker.check():
+            _LOGGER.debug("BMW MQTT connection blocked by circuit breaker")
+            # Update status so users know why MQTT isn't connected
+            if self._status_callback:
+                remaining = ""
+                rem = self._circuit_breaker.remaining_seconds
+                if rem is not None:
+                    remaining = f" ({rem}s remaining)"
+                self._run_coro_safe(
+                    cast(
+                        Coroutine[Any, Any, None],
+                        self._status_callback("circuit_breaker_open", f"Too many failures{remaining}"),
+                    )
+                )
+            raise ConnectionError("Circuit breaker is open")
+
+        # Check if already connecting or connected
+        if self._connection_state in (ConnectionState.CONNECTING, ConnectionState.CONNECTED):
+            if debug_enabled():
+                _LOGGER.debug(
+                    "BMW MQTT connection already in state %s; skipping start",
+                    self._connection_state.value,
+                )
+            return
+
         self._disconnect_future = None
+        self._intentional_disconnect = False
+
         if self._last_disconnect is not None:
             elapsed = time.monotonic() - self._last_disconnect
             delay = self._min_reconnect_interval - elapsed
@@ -75,15 +280,62 @@ class CardataStreamManager:
                         delay,
                     )
                 await asyncio.sleep(delay)
-        await self.hass.async_add_executor_job(self._start_client)
-        self._reconnect_backoff = 5
+
+        self._connection_state = ConnectionState.CONNECTING
+        # Notify coordinator that we're attempting to connect
+        if self._status_callback:
+            await self._status_callback("connecting", None)
+        try:
+            # Snapshot failure count so we can detect if _handle_connect already
+            # called record_failure() for this attempt (avoids double-counting).
+            failure_count_before = self._circuit_breaker.failure_count
+            # Use global lock to serialize MQTT connections across all config entries
+            # This prevents multi-account setups from overwhelming BMW servers or
+            # causing thread pool contention with simultaneous connection attempts
+            async with _GLOBAL_MQTT_CONNECT_LOCK:
+                if debug_enabled():
+                    _LOGGER.debug("Acquired global MQTT connection lock for entry %s", self._entry_id)
+                await self.hass.async_add_executor_job(self._start_client)
+                if debug_enabled():
+                    _LOGGER.debug("Released global MQTT connection lock for entry %s", self._entry_id)
+            self._reconnect_backoff = 5
+        except Exception:
+            self._connection_state = ConnectionState.FAILED
+            # Only record if MQTT callback didn't already record this failure
+            if self._circuit_breaker.failure_count == failure_count_before:
+                self._circuit_breaker.record_failure()
+            raise
 
     async def async_stop(self) -> None:
-        async with self._connect_lock:
+        # Acquire lock with timeout to prevent indefinite blocking
+        try:
+            await asyncio.wait_for(self._connect_lock.acquire(), timeout=LOCK_ACQUIRE_TIMEOUT)
+        except TimeoutError:
+            _LOGGER.warning("Connect lock held during stop; forcing cleanup")
+            self._intentional_disconnect = True
+            client = self._client
+            self._client = None
+            self._connection_state = ConnectionState.DISCONNECTED
+            if client:
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+                self._safe_loop_stop(client)
+            await stream_reconnect.async_cancel_retry(self)
+            return
+
+        try:
             await self._async_stop_locked()
+        finally:
+            self._connect_lock.release()
 
     async def _async_stop_locked(self) -> None:
-        disconnect_future: Optional[asyncio.Future[None]] = None
+        # Mark as intentional disconnect to prevent reconnection callbacks
+        self._intentional_disconnect = True
+        self._connection_state = ConnectionState.DISCONNECTING
+
+        disconnect_future: asyncio.Future[None] | None = None
         client = self._client
         self._client = None
         if client is not None:
@@ -101,36 +353,50 @@ class CardataStreamManager:
             if disconnect_future is not None:
                 try:
                     await asyncio.wait_for(disconnect_future, timeout=5)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     if debug_enabled():
                         _LOGGER.debug("Timeout waiting for BMW MQTT disconnect acknowledgement")
                 finally:
                     self._disconnect_future = None
-            try:
-                client.loop_stop()
-            except Exception as err:  # pragma: no cover - defensive logging
-                if debug_enabled():
-                    _LOGGER.debug("Error stopping BMW MQTT loop: %s", err)
+            self._safe_loop_stop(client)
+
+        self._connection_state = ConnectionState.DISCONNECTED
         self._last_disconnect = time.monotonic()
-        self._cancel_retry()
+        await stream_reconnect.async_cancel_retry(self)
 
     @property
-    def client(self) -> Optional[mqtt.Client]:
+    def client(self) -> mqtt.Client | None:
         return self._client
 
     def set_message_callback(self, callback: Callable[[dict], Awaitable[None]]) -> None:
         self._message_callback = callback
 
-    def set_status_callback(
-        self, callback: Callable[[str, Optional[str]], Awaitable[None]]
-    ) -> None:
+    def set_status_callback(self, callback: Callable[[str, str | None], Awaitable[None]]) -> None:
         self._status_callback = callback
 
     @property
     def debug_info(self) -> dict[str, str | int | bool]:
         """Return connection parameters for diagnostics."""
 
+        # Redact sensitive token - show only first 10 chars for debugging
+        redacted_token = f"{self._password[:10]}..." if self._password else ""
+
+        if self._custom_broker:
+            prefix = self._custom_mqtt_topic_prefix or "bmw/"
+            return {
+                "custom_broker": True,
+                "host": self._host,
+                "port": self._port,
+                "keepalive": self._keepalive,
+                "topic": f"{prefix}+",
+                "tls": self._custom_mqtt_tls,
+                "username": self._custom_mqtt_username or "(anonymous)",
+                "clean_session": True,
+                "protocol": "MQTTv311",
+            }
+
         return {
+            "custom_broker": False,
             "client_id": self._client_id,
             "gcid": self._gcid,
             "host": self._host,
@@ -139,117 +405,301 @@ class CardataStreamManager:
             "topic": f"{self._gcid}/+",
             "clean_session": True,
             "protocol": "MQTTv311",
-            "id_token": self._password,
+            "id_token": redacted_token,
         }
 
     def _start_client(self) -> None:
-        client_id = self._gcid
+        if self._custom_broker:
+            # Custom broker: use prefix-based topic (e.g. "bmw/+")
+            prefix = self._custom_mqtt_topic_prefix or "bmw/"
+            topic = f"{prefix}+"
+            client_id = f"cardata-ha-{self._entry_id or 'default'}"
+        else:
+            # BMW broker: use GCID-based topic
+            topic = f"{self._gcid}/+"
+            client_id = self._gcid
+
         client = mqtt.Client(
             client_id=client_id,
             clean_session=True,
-            # Subscribe only to direct VIN topics. Do not modify this unless BMW changes the stream contract.
-            userdata={"topic": f"{self._gcid}/+"},
+            userdata={"topic": topic},
             protocol=mqtt.MQTTv311,
             transport="tcp",
         )
         if debug_enabled():
             _LOGGER.debug(
-                "Initializing MQTT client: client_id=%s host=%s port=%s",
+                "Initializing MQTT client: client_id=%s host=%s port=%s custom_broker=%s",
                 client_id,
                 self._host,
                 self._port,
+                self._custom_broker,
             )
-        client.username_pw_set(username=self._gcid, password=self._password)
-        if debug_enabled():
-            _LOGGER.debug(
-                "MQTT credentials set for GCID %s (token length=%s)",
-                self._gcid,
-                len(self._password or ""),
-            )
+
+        if self._custom_broker:
+            # Custom broker: use configured username/password (if any)
+            if self._custom_mqtt_username:
+                client.username_pw_set(
+                    username=self._custom_mqtt_username,
+                    password=self._custom_mqtt_password or "",
+                )
+                if debug_enabled():
+                    _LOGGER.debug("Custom MQTT credentials set for user %s", self._custom_mqtt_username)
+        else:
+            # BMW broker: use GCID + id_token
+            client.username_pw_set(username=self._gcid, password=self._password)
+            if debug_enabled():
+                _LOGGER.debug(
+                    "MQTT credentials set for GCID %s (token length=%s)",
+                    self._gcid,
+                    len(self._password or ""),
+                )
+
         client.on_connect = self._handle_connect
         client.on_subscribe = self._handle_subscribe
         client.on_message = self._handle_message
         client.on_disconnect = self._handle_disconnect
-        context = ssl.create_default_context()
-        if hasattr(ssl, "TLSVersion"):
-            # Require modern TLS, but let OpenSSL negotiate the newest version
-            # the BMW broker supports instead of pinning us to exactly TLS 1.2.
-            context.minimum_version = ssl.TLSVersion.TLSv1_2
-        client.tls_set_context(context)
-        client.tls_insecure_set(False)
+
+        if self._custom_broker:
+            # Custom broker: configure TLS based on user setting
+            if self._custom_mqtt_tls == "tls":
+                context = ssl.create_default_context()
+                client.tls_set_context(context)
+                client.tls_insecure_set(False)
+            elif self._custom_mqtt_tls == "tls_insecure":
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                client.tls_set_context(context)
+                client.tls_insecure_set(True)
+            # else: "off" — no TLS, plain TCP
+        else:
+            # BMW broker: require TLS 1.3 with full certificate validation
+            context = ssl.create_default_context()
+            if not hasattr(ssl, "TLSVersion") or not hasattr(ssl.TLSVersion, "TLSv1_3"):
+                ssl_lib = getattr(ssl, "OPENSSL_VERSION", "unknown SSL library")
+                raise ConnectionError(
+                    f"BMW CarData MQTT requires TLS 1.3 but your SSL library "
+                    f"({ssl_lib}) does not support it. Upgrade to OpenSSL 1.1.1+, "
+                    f"LibreSSL 3.2.0+, or use a newer Home Assistant OS image."
+                )
+            context.minimum_version = ssl.TLSVersion.TLSv1_3
+            client.tls_set_context(context)
+            client.tls_insecure_set(False)
+
         client.reconnect_delay_set(min_delay=5, max_delay=60)
 
-        try:
-            client.connect(self._host, self._port, keepalive=self._keepalive)
-        except Exception as err:
-            _LOGGER.error("Unable to connect to BMW MQTT: %s", err)
-            client.loop_stop()
-            raise
+        # Use connect_async() with threading.Event to avoid modifying global socket timeout
+        # which could affect other concurrent connections in Home Assistant
+        self._connect_event = threading.Event()
+        self._connect_rc = None
+
+        # Start the network loop first (required for connect_async)
         client.loop_start()
-        self._client = client
+        loop_started = True
+
+        try:
+            # Initiate async connection - actual connection happens in loop thread
+            client.connect_async(self._host, self._port, keepalive=self._keepalive)
+
+            # Wait for on_connect callback to signal completion
+            if not self._connect_event.wait(timeout=self._connect_timeout):
+                _LOGGER.debug(
+                    "BMW MQTT connection timed out after %.0f seconds (entry %s)", self._connect_timeout, self._entry_id
+                )
+                self._connect_event = None
+                raise TimeoutError(f"MQTT connection timed out after {self._connect_timeout} seconds")
+
+            # Check connection result from on_connect callback
+            rc = self._connect_rc
+            self._connect_event = None
+
+            if rc is None or rc != 0:
+                error_reasons = {
+                    -1: "Connection lost before MQTT handshake",
+                    1: "Incorrect protocol version",
+                    2: "Invalid client identifier",
+                    3: "Server unavailable",
+                    4: "Bad username or password",
+                    5: "Not authorized",
+                }
+                error_reason = (
+                    error_reasons.get(rc, f"Unknown error (rc={rc})") if rc is not None else "No response received"
+                )
+                _LOGGER.warning("BMW MQTT connection failed (entry %s): %s", self._entry_id, error_reason)
+                raise ConnectionError(f"MQTT connection failed: {error_reason}")
+
+            # Success - transfer ownership to self._client
+            self._client = client
+            loop_started = False  # Loop now managed by self._client
+
+        except Exception as err:
+            self._connect_event = None
+            if not isinstance(err, (TimeoutError, ConnectionError)):
+                _LOGGER.error("Unable to connect to BMW MQTT: %s", err)
+            raise
+        finally:
+            # Ensure loop is stopped if connection failed
+            if loop_started:
+                self._safe_loop_stop(client)
 
     def _handle_connect(self, client: mqtt.Client, userdata, flags, rc) -> None:
+        # Signal the connect event for synchronous waiters (used during initial connection)
+        self._connect_rc = rc
+        if self._connect_event is not None:
+            self._connect_event.set()
+
         if rc == 0:
+            self._connection_state = ConnectionState.CONNECTED
+            # Circuit breaker success is recorded on the SUBACK grant, not here.
+            # The broker can accept the connection and then refuse the
+            # subscription, which would leave us connected but receiving nothing.
+            self._custom_auth_failures = 0
+            self._custom_auth_retry_blocked = False
+
+            if self._entry_id:
+                from .const import DOMAIN
+
+                runtime = self.hass.data.get(DOMAIN, {}).get(self._entry_id)
+                if runtime and runtime.unauthorized_protection:
+                    runtime.unauthorized_protection.record_success()
+
             topic = userdata.get("topic")
             if topic:
                 result = client.subscribe(topic)
                 if debug_enabled():
-                    _LOGGER.debug("Subscribed to %s result=%s", topic, result)
+                    _LOGGER.debug("Subscribed to %s result=%s", redact_vin_in_text(topic), result)
             if self._reauth_notified:
-                self._reauth_notified = False
-                self._awaiting_new_credentials = False
-                asyncio.run_coroutine_threadsafe(self._notify_recovered(), self.hass.loop)
-            self._cancel_retry()
+                # Schedule async reset of flags with proper locking
+                self._run_coro_safe(stream_reconnect.async_clear_reauth_state(self))
+            stream_reconnect.cancel_retry(self)
             self._last_disconnect = None
             self._retry_backoff = 3
+            self._consecutive_reconnect_failures = 0
             if self._status_callback:
-                asyncio.run_coroutine_threadsafe(
-                    self._status_callback("connected"),
-                    self.hass.loop,
-                )
+                self._run_coro_safe(cast(Coroutine[Any, Any, None], self._status_callback("connected", None)))
         elif rc in (4, 5):  # bad credentials / not authorized
-            now = time.monotonic()
-            if (
-                rc == 5
-                and self._last_disconnect is not None
-                and now - self._last_disconnect < 10
-            ):
-                if debug_enabled():
-                    _LOGGER.debug(
-                        "BMW MQTT connection refused shortly after disconnect; scheduling retry"
-                    )
-                client.loop_stop(force=True)
+            self._connection_state = ConnectionState.FAILED
+            self._circuit_breaker.record_failure()
+
+            if self._custom_broker:
+                # Custom broker: don't trigger BMW reauth.
+                # Limit retries to avoid hammering on wrong credentials.
+                self._custom_auth_failures += 1
+                attempts = self._custom_auth_failures
+                _LOGGER.warning(
+                    "Custom MQTT broker authentication failed (rc=%s, attempt %d/%d); check username/password",
+                    rc,
+                    attempts,
+                    self._CUSTOM_BROKER_MAX_AUTH_RETRIES,
+                )
+                self._safe_loop_stop(client)
                 self._client = None
-                self._schedule_retry(3)
+
+                if attempts >= self._CUSTOM_BROKER_MAX_AUTH_RETRIES:
+                    self._custom_auth_retry_blocked = True
+                    reason = "Custom MQTT auth failed repeatedly; automatic retries stopped"
+                    _LOGGER.error(
+                        "%s (entry %s). Update custom broker credentials and reload integration.",
+                        reason,
+                        self._entry_id,
+                    )
+                    if self._status_callback:
+                        self._run_coro_safe(
+                            cast(Coroutine[Any, Any, None], self._status_callback("unauthorized_blocked", reason))
+                        )
+                    return
+
+                stream_reconnect.schedule_retry(self, 10)
                 return
-            _LOGGER.error("BMW MQTT connection failed: rc=%s", rc)
-            asyncio.run_coroutine_threadsafe(self._handle_unauthorized(), self.hass.loop)
-            client.loop_stop()
+
+            now = time.monotonic()
+            if rc == 5 and self._last_disconnect is not None and now - self._last_disconnect < 10:
+                if debug_enabled():
+                    _LOGGER.debug("BMW MQTT connection refused shortly after disconnect; scheduling retry")
+                self._safe_loop_stop(client)
+                self._client = None
+                stream_reconnect.schedule_retry(self, 3)
+                return
+
+            # Auth Faliure - Log as debug to reduce alarm, its self-healing
+            _LOGGER.debug("BMW MQTT connection requires auth (rc=%s); refresh credentials", rc)
+            self._run_coro_safe(stream_reconnect.handle_unauthorized(self))
+            self._safe_loop_stop(client)
             self._client = None
             return
-        elif self._status_callback:
-            asyncio.run_coroutine_threadsafe(
-                self._status_callback("connection_failed", reason=str(rc)),
-                self.hass.loop,
-            )
+        else:
+            self._connection_state = ConnectionState.FAILED
+            self._circuit_breaker.record_failure()
+            if self._status_callback:
+                self._run_coro_safe(
+                    cast(Coroutine[Any, Any, None], self._status_callback("connection_failed", str(rc)))
+                )
 
     def _handle_subscribe(self, client: mqtt.Client, userdata, mid, granted_qos) -> None:
+        # granted_qos is a tuple of ints (paho VERSION1 callbacks, MQTT 3.1.1);
+        # a value of 0x80 means the broker refused that subscription. A refused
+        # SUBACK leaves the socket connected while no messages ever arrive, so
+        # treat it as a connection failure and reconnect instead of reporting
+        # the stream as healthy.
+        if any(getattr(qos, "value", qos) >= 0x80 for qos in granted_qos):
+            _LOGGER.warning(
+                "BMW MQTT subscription refused (mid=%s granted_qos=%s); reconnecting",
+                mid,
+                granted_qos,
+            )
+            self._connection_state = ConnectionState.FAILED
+            self._circuit_breaker.record_failure()
+            if self._status_callback:
+                self._run_coro_safe(
+                    cast(
+                        Coroutine[Any, Any, None],
+                        self._status_callback("connection_failed", "MQTT subscription refused"),
+                    )
+                )
+            self._safe_loop_stop(client)
+            self._client = None
+            stream_reconnect.schedule_retry(self, 3)
+            return
+
+        self._circuit_breaker.record_success()
         if debug_enabled():
-            if debug_enabled():
-                _LOGGER.debug("BMW MQTT subscribed mid=%s qos=%s", mid, granted_qos)
+            _LOGGER.debug("BMW MQTT subscribed mid=%s qos=%s", mid, granted_qos)
 
     def _handle_message(self, client: mqtt.Client, userdata, msg: mqtt.MQTTMessage) -> None:
-        payload = msg.payload.decode(errors="ignore")
-        if debug_enabled():
-            _LOGGER.debug("BMW MQTT message on %s: %s", msg.topic, payload)
-        if not self._message_callback:
-            return
+        """Handle incoming MQTT message with full exception protection.
+
+        This method is called from the MQTT client's network thread. Any unhandled
+        exception here would crash the MQTT message processing loop, so we wrap
+        everything in try/except to ensure robustness.
+        """
         try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            return
-        if self._message_callback:
-            asyncio.run_coroutine_threadsafe(self._message_callback(data), self.hass.loop)
+            # Handle various payload types from MQTT
+            raw_payload = msg.payload
+            if raw_payload is None:
+                return  # No payload to process
+            elif isinstance(raw_payload, str):
+                payload = raw_payload  # Already a string
+            elif isinstance(raw_payload, memoryview):
+                payload = bytes(raw_payload).decode(errors="ignore")
+            else:
+                payload = raw_payload.decode(errors="ignore")
+            if debug_enabled():
+                _LOGGER.debug(
+                    "BMW MQTT message on %s: %s",
+                    redact_vin_in_text(msg.topic),
+                    redact_vin_payload(payload),
+                )
+            if not self._message_callback:
+                return
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                _LOGGER.debug("Failed to parse MQTT message as JSON: %s", redact_vin_in_text(payload[:100]))
+                return
+            self._run_coro_safe(cast(Coroutine[Any, Any, None], self._message_callback(data)))
+        except Exception as err:
+            # Catch-all to prevent crashing the MQTT callback thread
+            _LOGGER.exception("Unexpected error in MQTT message handler: %s", err)
 
     def _handle_disconnect(self, client: mqtt.Client, userdata, rc) -> None:
         reason = {
@@ -259,179 +709,170 @@ class CardataStreamManager:
             4: "Bad username or password",
             5: "Not authorized",
         }.get(rc, "Unknown")
-        _LOGGER.warning("BMW MQTT disconnected rc=%s (%s)", rc, reason)
+
+        # If _connect_event is still pending, the TCP connection failed before
+        # the MQTT handshake completed (on_connect was never called).
+        # Signal it immediately so _start_client doesn't wait the full timeout.
+        if self._connect_event is not None and not self._connect_event.is_set():
+            self._connect_rc = rc if rc != 0 else -1
+            self._connect_event.set()
+
+        # Only log if not an intentional disconnect
+        if not self._intentional_disconnect:
+            if rc == 0:
+                # clean disconnect
+                if debug_enabled():
+                    _LOGGER.debug("BMW MQTT disconnected cleanly")
+            elif rc == 7:
+                if debug_enabled():
+                    _LOGGER.debug("BMW MQTT disconnected due to client inactivity")
+            elif rc in (4, 5):
+                _LOGGER.debug("Authorized BMW MQTT disconnect rc=%s (%s)", rc, reason)
+            else:
+                _LOGGER.warning("BMW MQTT disconnected rc=%s (%s)", rc, reason)
+        elif debug_enabled():
+            _LOGGER.debug("BMW MQTT intentional disconnect rc=%s", rc)
+
+        previous_disconnect = self._last_disconnect
         self._last_disconnect = time.monotonic()
+
+        # Update connection state — skip if already FAILED (set by _handle_connect
+        # for rc=4/5) to prevent double-counting in circuit breaker
+        if self._connection_state not in (ConnectionState.DISCONNECTING, ConnectionState.FAILED):
+            self._connection_state = ConnectionState.DISCONNECTED
+            if rc != 0:
+                self._circuit_breaker.record_failure()
+
         disconnect_future = self._disconnect_future
         if disconnect_future and not disconnect_future.done():
+
             def _set_disconnect() -> None:
                 if not disconnect_future.done():
                     disconnect_future.set_result(None)
 
             self.hass.loop.call_soon_threadsafe(_set_disconnect)
+
+        # Don't reconnect if this was intentional
+        if self._intentional_disconnect:
+            return
+
         should_reconnect = True
         if isinstance(userdata, dict):
             should_reconnect = userdata.get("reconnect", True)
             userdata["reconnect"] = True
+
         if rc in (4, 5):
-            now = time.monotonic()
-            if (
-                rc == 5
-                and self._last_disconnect is not None
-                and now - self._last_disconnect < 10
-            ):
-                if debug_enabled():
-                    _LOGGER.debug(
-                        "Ignoring transient MQTT rc=5; scheduling retry instead"
+            if self._custom_broker:
+                # Custom broker: just reconnect, don't trigger BMW reauth
+                if self._custom_auth_retry_blocked:
+                    reason = "Custom MQTT auth failed repeatedly; automatic retries stopped"
+                    if self._status_callback:
+                        self._run_coro_safe(
+                            cast(Coroutine[Any, Any, None], self._status_callback("unauthorized_blocked", reason))
+                        )
+                    return
+                if should_reconnect and not self._circuit_breaker.check():
+                    self._run_coro_safe(stream_reconnect.async_reconnect(self))
+                if self._status_callback:
+                    self._run_coro_safe(
+                        cast(Coroutine[Any, Any, None], self._status_callback("connection_failed", reason))
                     )
-                self._schedule_retry(3)
                 return
-            asyncio.run_coroutine_threadsafe(self._handle_unauthorized(), self.hass.loop)
-            self._reconnect_backoff = min(self._reconnect_backoff * 2, self._max_backoff)
+            now = time.monotonic()
+            if rc == 5 and previous_disconnect is not None and now - previous_disconnect < 10:
+                if debug_enabled():
+                    _LOGGER.debug("Ignoring transient MQTT rc=5; scheduling retry instead")
+                stream_reconnect.schedule_retry(self, 3)
+                return
+            self._run_coro_safe(stream_reconnect.handle_unauthorized(self))
             if self._status_callback:
-                asyncio.run_coroutine_threadsafe(
-                    self._status_callback("unauthorized", reason=reason),
-                    self.hass.loop,
-                )
+                self._run_coro_safe(cast(Coroutine[Any, Any, None], self._status_callback("unauthorized", reason)))
         else:
-            if should_reconnect:
-                asyncio.run_coroutine_threadsafe(self._async_reconnect(), self.hass.loop)
+            if should_reconnect and not self._circuit_breaker.check():
+                self._run_coro_safe(stream_reconnect.async_reconnect(self))
             if self._status_callback:
-                asyncio.run_coroutine_threadsafe(
-                    self._status_callback("disconnected", reason=reason),
-                    self.hass.loop,
-                )
+                self._run_coro_safe(cast(Coroutine[Any, Any, None], self._status_callback("disconnected", reason)))
 
-    async def _async_reconnect(self) -> None:
-        await self.async_stop()
-        await asyncio.sleep(self._reconnect_backoff)
-        try:
-            await self.async_start()
-        except Exception as err:
-            _LOGGER.error("BMW MQTT reconnect failed: %s", err)
-            self._reconnect_backoff = min(self._reconnect_backoff * 2, self._max_backoff)
-        else:
-            self._reconnect_backoff = 5
+    def set_credentials(
+        self,
+        *,
+        gcid: str | None = None,
+        id_token: str | None = None,
+    ) -> None:
+        """Update credentials in memory without reconnecting or acquiring locks.
 
-    async def _handle_unauthorized(self) -> None:
-        if self._unauthorized_retry_in_progress:
-            return
-        self._unauthorized_retry_in_progress = True
-        try:
-            self._awaiting_new_credentials = True
-            if not self._reauth_notified:
-                self._reauth_notified = True
-                await self._notify_error("unauthorized")
-            else:
-                await self.async_stop()
-            if self._status_callback:
-                await self._status_callback("unauthorized", reason="MQTT rc=5")
-        finally:
-            self._unauthorized_retry_in_progress = False
-
-    async def _notify_error(self, reason: str) -> None:
-        await self.async_stop()
-        if self._error_callback:
-            await self._error_callback(reason)
-
-    async def _notify_recovered(self) -> None:
-        if self._error_callback:
-            await self._error_callback("recovered")
+        Use this when the caller will handle reconnection separately
+        (e.g. _async_reconnect already holds _connect_lock and restarts MQTT itself).
+        """
+        if gcid and gcid != self._gcid:
+            self._gcid = gcid
+        if id_token and id_token != self._password:
+            self._password = id_token
 
     async def async_update_credentials(
         self,
         *,
-        gcid: Optional[str] = None,
-        id_token: Optional[str] = None,
+        gcid: str | None = None,
+        id_token: str | None = None,
     ) -> None:
         if not gcid and not id_token:
             return
 
-        reconnect_required = False
+        # Acquire lock with timeout to prevent indefinite blocking
+        try:
+            await asyncio.wait_for(self._credential_lock.acquire(), timeout=LOCK_ACQUIRE_TIMEOUT)
+        except TimeoutError:
+            _LOGGER.debug("Credential lock held; credential update already in progress")
+            return
 
-        if gcid and gcid != self._gcid:
-            _LOGGER.debug("Updating MQTT GCID from %s to %s", self._gcid, gcid)
-            self._gcid = gcid
-            reconnect_required = True
+        try:
+            reconnect_required = False
 
-        if id_token and id_token != self._password:
-            self._password = id_token
-            reconnect_required = True
+            if gcid and gcid != self._gcid:
+                _LOGGER.debug("Updating MQTT GCID from %s to %s", self._gcid, gcid)
+                self._gcid = gcid
+                reconnect_required = True
 
-        if not reconnect_required:
-            if self._awaiting_new_credentials:
-                self._awaiting_new_credentials = False
-                if self._client is None:
+            if id_token and id_token != self._password:
+                self._password = id_token
+                reconnect_required = True
+
+            if not reconnect_required:
+                # Check and clear flag under lock to prevent races
+                async with self._unauthorized_lock:
+                    was_awaiting = self._awaiting_new_credentials
+                    if was_awaiting:
+                        self._awaiting_new_credentials = False
+                if was_awaiting and self._client is None:
                     try:
                         await self.async_start()
                     except Exception as err:
-                        _LOGGER.error(
+                        _LOGGER.warning(
                             "BMW MQTT reconnect failed after credential refresh: %s",
                             err,
                         )
-            return
-
-        if self._client:
-            _LOGGER.debug("Updating MQTT credentials; reconnecting")
-            await self.async_stop()
-
-        self._reconnect_backoff = 5
-        if self._awaiting_new_credentials:
-            self._awaiting_new_credentials = False
-
-        delay = 0.0
-        if self._last_disconnect is not None:
-            elapsed = time.monotonic() - self._last_disconnect
-            if elapsed < 2.0:
-                delay = 2.0 - elapsed
-        if delay > 0:
-            await asyncio.sleep(delay)
-
-        try:
-            await self.async_start()
-        except Exception as err:
-            _LOGGER.error("BMW MQTT reconnect failed after credential update: %s", err)
-
-    async def async_update_token(self, id_token: Optional[str]) -> None:
-        await self.async_update_credentials(id_token=id_token)
-
-    def _cancel_retry(self) -> None:
-        if self._retry_task and not self._retry_task.done():
-            self._retry_task.cancel()
-        self._retry_task = None
-        self._retry_backoff = 3
-
-    def _schedule_retry(self, delay: float) -> None:
-        if self._retry_task is not None and not self._retry_task.done():
-            return
-
-        delay = max(delay, self._retry_backoff, self._min_reconnect_interval)
-        self._retry_backoff = min(self._retry_backoff * 2, 30)
-        self._last_disconnect = time.monotonic()
-
-        async def _retry() -> None:
-            try:
-                await asyncio.sleep(delay)
-                if self._client is None:
-                    if (
-                        self._disconnect_future is not None
-                        and not self._disconnect_future.done()
-                    ):
-                        try:
-                            await asyncio.wait_for(self._disconnect_future, timeout=10)
-                        except asyncio.TimeoutError:
-                            if debug_enabled():
-                                _LOGGER.debug(
-                                    "Timed out waiting for previous BMW MQTT disconnect before retry"
-                                )
-                        finally:
-                            self._disconnect_future = None
-                    async with self._connect_lock:
-                        await self._async_start_locked()
-            except asyncio.CancelledError:
                 return
-            except Exception as err:  # pragma: no cover - defensive logging
-                _LOGGER.error("BMW MQTT retry failed: %s", err)
-            finally:
-                self._retry_task = None
 
-        self._retry_task = self.hass.loop.create_task(_retry())
+            if self._client:
+                _LOGGER.debug("Updating MQTT credentials; reconnecting")
+                await self.async_stop()
+
+            self._reconnect_backoff = 5
+            # Clear flag under lock to prevent races
+            async with self._unauthorized_lock:
+                self._awaiting_new_credentials = False
+
+            delay = 0.0
+            if self._last_disconnect is not None:
+                elapsed = time.monotonic() - self._last_disconnect
+                if elapsed < 2.0:
+                    delay = 2.0 - elapsed
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            try:
+                await self.async_start()
+            except Exception as err:
+                _LOGGER.warning("BMW MQTT reconnect failed after credential update: %s", err)
+        finally:
+            self._credential_lock.release()

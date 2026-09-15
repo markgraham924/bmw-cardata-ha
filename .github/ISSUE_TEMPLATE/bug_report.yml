@@ -1,0 +1,120 @@
+name: Bug Report
+description: Report a problem with the BMW CarData Home Assistant integration
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report an issue!
+
+        Please fill out all required fields — issues without debug logs will be closed.
+
+        **Reports that appear to be written or analysed by an LLM without accompanying real debug logs will be closed without investigation.** Polished code-level analysis is not a substitute for reproduction data. Using an LLM to help describe your problem is fine, but the debug logs must be real and included.
+
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version
+      placeholder: "e.g. 2024.12.1"
+    validations:
+      required: true
+
+  - type: input
+    id: integration_version
+    attributes:
+      label: BMW CarData HA integration version
+      placeholder: "e.g. v4.2.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Installation method
+      options:
+        - HACS
+        - Manual
+    validations:
+      required: true
+
+  - type: input
+    id: vehicle
+    attributes:
+      label: BMW vehicle model & year
+      placeholder: "e.g. BMW i4 2023"
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the issue in detail. What did you expect to happen and what actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1.
+        2.
+        3.
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: If you have screenshots or screen recordings, add them here.
+
+  - type: textarea
+    id: debug_logs
+    attributes:
+      label: Debug logs
+      description: |
+        Enable debug logging, reproduce the issue, and paste the logs here.
+
+        The integration already redacts VINs (e.g. `WBY...9486`) and bearer
+        tokens / Authorization headers in error messages. You only need to
+        redact things it doesn't auto-redact: account email, precise GPS
+        coordinates, and anything visible in attached screenshots.
+
+        Please leave entry IDs (UUID-like), container IDs (e.g.
+        `G00B025F732UD`), GCIDs, and BMW descriptor names visible — they're
+        internal identifiers, not personal data, and removing them makes
+        diagnosis harder.
+
+        Enable debug logging by adding this to your configuration.yaml:
+        ```yaml
+        logger:
+          default: info
+          logs:
+            custom_components.cardata: debug
+        ```
+        or set debug_log in const.py to true and restart HA.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Any other information that might help (recent HA updates, BMW ConnectedDrive changes, API issues, etc.).
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I'm using the latest version of the integration
+          required: true
+        - label: I've searched existing issues to avoid duplicates
+          required: true
+        - label: I've included debug logs and version information
+          required: true
+        - label: If I used an LLM to help write this report, I have included real debug logs (not reconstructed from reading the source code)
+          required: true
+        - label: "For frontend/card issues: I've done a full browser cache refresh (Ctrl+Shift+R on Windows/Linux, Cmd+Shift+R on macOS, or Reset Frontend Cache in the mobile companion app)"
+          required: false

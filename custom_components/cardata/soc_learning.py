@@ -1,0 +1,516 @@
+# Copyright (c) 2025, Renaud Allard <renaud@allard.it>, Kris Van Biesen <kvanbiesen@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+"""Learning, session finalization, and persistence for SOC prediction."""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import TYPE_CHECKING, Any
+
+from .const import (
+    AC_SESSION_FINALIZE_MINUTES,
+    DC_SESSION_FINALIZE_MINUTES,
+    MAX_MISATTRIBUTED_ENERGY_SHARE,
+    MAX_VALID_EFFICIENCY,
+    MIN_LEARNING_SOC_GAIN,
+    MIN_VALID_EFFICIENCY,
+    TARGET_SOC_TOLERANCE,
+)
+from .soc_types import ChargingSession, LearnedEfficiency, PendingSession
+from .utils import redact_vin
+
+if TYPE_CHECKING:
+    from .soc_prediction import SOCPredictor
+
+_LOGGER = logging.getLogger(__name__)
+
+# Default efficiency values (single source of truth: LearnedEfficiency dataclass defaults)
+_DEFAULT_EFFICIENCY = LearnedEfficiency()
+
+
+def get_session_data(predictor: SOCPredictor) -> dict[str, Any]:
+    """Get charging session data for persistence.
+
+    Returns:
+        Dictionary with learned_efficiency, pending_sessions, active_sessions,
+        charging_status, and battery_capacities sections.
+    """
+    return {
+        "learned_efficiency": {vin: eff.to_dict() for vin, eff in predictor._learned_efficiency.items()},
+        "pending_sessions": {vin: ps.to_dict() for vin, ps in predictor._pending_sessions.items()},
+        "active_sessions": {vin: s.to_dict() for vin, s in predictor._sessions.items()},
+        "charging_status": {vin: v for vin, v in predictor._is_charging.items() if v},
+    }
+
+
+def load_session_data(predictor: SOCPredictor, data: dict[str, Any]) -> None:
+    """Load charging session data from storage (v1 or v2 format).
+
+    v1 format: flat dict mapping VIN to learned efficiency data.
+    v2 format: dict with learned_efficiency, pending_sessions, active_sessions,
+    and charging_status keys.
+
+    Ignores keys it doesn't own (driving keys handled by MagicSOCPredictor).
+    """
+    if "learned_efficiency" not in data:
+        # v1 migration: entire dict is learned efficiency
+        load_learned_efficiency(predictor, data)
+        _LOGGER.debug("Loaded v1 SOC learning data (migrated)")
+        return
+
+    # v2 format
+    learned = data.get("learned_efficiency") or {}
+    for vin, eff_data in learned.items():
+        try:
+            predictor._learned_efficiency[vin] = LearnedEfficiency.from_dict(eff_data)
+        except Exception as err:
+            _LOGGER.warning("SOC: Failed to load learned efficiency for %s: %s", redact_vin(vin), err)
+
+    pending = data.get("pending_sessions") or {}
+    for vin, ps_data in pending.items():
+        try:
+            predictor._pending_sessions[vin] = PendingSession.from_dict(ps_data)
+        except Exception as err:
+            _LOGGER.warning("SOC: Failed to load pending session for %s: %s", redact_vin(vin), err)
+
+    active = data.get("active_sessions") or {}
+    for vin, s_data in active.items():
+        try:
+            session = ChargingSession.from_dict(s_data)
+            predictor._sessions[vin] = session
+            predictor._last_predicted_soc[vin] = session.last_predicted_soc
+            if session.charging_method:
+                predictor._charging_method[vin] = session.charging_method
+        except Exception as err:
+            _LOGGER.warning("SOC: Failed to load active session for %s: %s", redact_vin(vin), err)
+
+    charging = data.get("charging_status") or {}
+    for vin, is_charging in charging.items():
+        try:
+            predictor._is_charging[vin] = bool(is_charging)
+        except Exception as err:
+            _LOGGER.warning("SOC: Failed to load charging status for %s: %s", redact_vin(vin), err)
+
+    _LOGGER.debug(
+        "Loaded v2 SOC data: %d learned, %d pending, %d active, %d charging",
+        len(predictor._learned_efficiency),
+        len(predictor._pending_sessions),
+        len(predictor._sessions),
+        sum(1 for v in predictor._is_charging.values() if v),
+    )
+
+
+def load_learned_efficiency(predictor: SOCPredictor, data: dict[str, dict[str, Any]]) -> None:
+    """Load learned efficiency data from storage.
+
+    Args:
+        data: Dictionary mapping VIN to learned efficiency data
+    """
+    for vin, efficiency_data in data.items():
+        predictor._learned_efficiency[vin] = LearnedEfficiency.from_dict(efficiency_data)
+    _LOGGER.debug("Loaded learned efficiency for %d vehicle(s)", len(data))
+
+
+def reset_learned_efficiency(predictor: SOCPredictor, vin: str, charging_method: str | None = None) -> bool:
+    """Reset learned efficiency for a VIN.
+
+    Args:
+        vin: Vehicle identification number
+        charging_method: "AC", "DC", or None to reset both
+
+    Returns:
+        True if anything was reset, False otherwise
+    """
+    learned = predictor._learned_efficiency.get(vin)
+    if not learned:
+        _LOGGER.debug("No learned efficiency to reset for %s", redact_vin(vin))
+        return False
+
+    if charging_method is None:
+        # Reset both AC matrix and DC
+        del predictor._learned_efficiency[vin]
+        _LOGGER.info("Reset all learned efficiency for %s", redact_vin(vin))
+    elif charging_method.upper() == "AC":
+        # Clear AC entries from matrix (phases > 0)
+        ac_keys = [c for c in learned.efficiency_matrix if c.phases > 0]
+        for key in ac_keys:
+            del learned.efficiency_matrix[key]
+        _LOGGER.info("Reset AC learned efficiency matrix for %s", redact_vin(vin))
+    elif charging_method.upper() == "DC":
+        # Clear DC entries from matrix (phases == 0)
+        dc_keys = [c for c in learned.efficiency_matrix if c.phases == 0]
+        for key in dc_keys:
+            del learned.efficiency_matrix[key]
+        _LOGGER.info("Reset DC learned efficiency for %s", redact_vin(vin))
+    else:
+        _LOGGER.warning("Invalid charging method for reset: %s", charging_method)
+        return False
+
+    if predictor._on_learning_updated:
+        predictor._on_learning_updated(vin)
+    return True
+
+
+def _phase_count_misattributed(session: ChargingSession) -> bool:
+    """Whether enough of the session ran under a phase count it later corrected.
+
+    Energy integrated under two different counts belongs to neither, but the
+    correction usually arrives moments after the charge starts, and refusing to
+    learn from a three hour session because its first minute was accounted for
+    at one phase would quietly switch learning off altogether.
+    """
+    misattributed = session.phases_changed_gross_kwh
+    if misattributed <= 0:
+        return False
+    total = session.session_gross_energy_kwh
+    return total <= 0 or misattributed / total > MAX_MISATTRIBUTED_ENERGY_SHARE
+
+
+def end_session(
+    predictor: SOCPredictor,
+    vin: str,
+    current_soc: float,
+    target_soc: float | None = None,
+) -> None:
+    """End a charging session and attempt to finalize learning.
+
+    If target was reached, finalize immediately. Otherwise, store as pending
+    and wait for BMW SOC confirmation.
+
+    Args:
+        vin: Vehicle identification number
+        current_soc: Current SOC at end of charge
+        target_soc: Charging target SOC (if known)
+    """
+    session = predictor._sessions.get(vin)
+    if not session:
+        _LOGGER.debug("SOC: No active session to end for %s", redact_vin(vin))
+        return
+
+    # Preserve last predicted for stale fallback
+    predictor._last_predicted_soc[vin] = session.last_predicted_soc
+
+    if session.restored or _phase_count_misattributed(session):
+        reason = "energy data incomplete" if session.restored else "phase count changed mid-charge"
+        _LOGGER.info(
+            "SOC: Ending session for %s without learning (%s)",
+            redact_vin(vin),
+            reason,
+        )
+        del predictor._sessions[vin]
+        predictor._charging_method.pop(vin, None)
+        if predictor._on_learning_updated:
+            predictor._on_learning_updated(vin)
+        return
+
+    # Check if target was reached (within tolerance)
+    if target_soc is not None and abs(current_soc - target_soc) <= TARGET_SOC_TOLERANCE:
+        _LOGGER.debug(
+            "SOC: Charge target reached for %s (%.1f%% ≈ %.1f%%), finalizing immediately",
+            redact_vin(vin),
+            current_soc,
+            target_soc,
+        )
+        _finalize_learning(predictor._learned_efficiency, None, vin, session, end_soc=current_soc)
+    else:
+        # Charge interrupted - wait for BMW SOC confirmation
+        _LOGGER.debug(
+            "SOC: Charge interrupted for %s (%.1f%%, target: %s), awaiting BMW SOC",
+            redact_vin(vin),
+            current_soc,
+            target_soc,
+        )
+        start_soc = session.session_start_soc if session.session_start_soc is not None else session.anchor_soc
+        energy = session.session_total_energy_kwh if session.session_total_energy_kwh > 0 else session.total_energy_kwh
+        predictor._pending_sessions[vin] = PendingSession(
+            end_timestamp=time.time(),
+            anchor_soc=start_soc,
+            total_energy_kwh=energy,
+            charging_method=session.charging_method,
+            battery_capacity_kwh=session.battery_capacity_kwh,
+            phases=session.phases,
+            voltage=session.last_voltage if session.last_voltage else 230.0,
+            current=session.last_current if session.last_current else 16.0,
+        )
+
+    # Clear active session and charging method
+    del predictor._sessions[vin]
+    predictor._charging_method.pop(vin, None)
+
+    # Persist updated state (pending session added or session removed)
+    if predictor._on_learning_updated:
+        predictor._on_learning_updated(vin)
+
+
+def try_finalize_pending_session(predictor: SOCPredictor, vin: str, bmw_soc: float, soc_timestamp: float) -> bool:
+    """Attempt to finalize a pending session with fresh BMW SOC.
+
+    Args:
+        vin: Vehicle identification number
+        bmw_soc: BMW-reported SOC percentage
+        soc_timestamp: Unix timestamp of the SOC reading
+
+    Returns:
+        True if session was finalized, False otherwise
+    """
+    pending = predictor._pending_sessions.get(vin)
+    if not pending:
+        return False
+
+    elapsed_minutes = (soc_timestamp - pending.end_timestamp) / 60.0
+
+    if elapsed_minutes < 0:
+        # SOC update is from before session ended - ignore
+        return False
+
+    # Check grace period based on charging method
+    grace_minutes = DC_SESSION_FINALIZE_MINUTES if pending.charging_method == "DC" else AC_SESSION_FINALIZE_MINUTES
+
+    if elapsed_minutes > grace_minutes:
+        _LOGGER.debug(
+            "SOC: Discarding pending session for %s: SOC arrived %.1f min after charge end (limit: %.1f)",
+            redact_vin(vin),
+            elapsed_minutes,
+            grace_minutes,
+        )
+        del predictor._pending_sessions[vin]
+        if predictor._on_learning_updated:
+            predictor._on_learning_updated(vin)
+        return False
+
+    # Finalize learning with this SOC
+    _finalize_learning_from_pending(predictor._learned_efficiency, None, vin, pending, bmw_soc)
+    del predictor._pending_sessions[vin]
+    # Persist removal of pending session (even if learning was rejected)
+    if predictor._on_learning_updated:
+        predictor._on_learning_updated(vin)
+    return True
+
+
+def _validate_and_learn(
+    learned_efficiency: dict[str, LearnedEfficiency],
+    on_learning_updated: Any,
+    vin: str,
+    anchor_soc: float,
+    total_energy_kwh: float,
+    battery_capacity_kwh: float,
+    charging_method: str,
+    phases: int,
+    voltage: float,
+    current: float,
+    end_soc: float,
+    label: str,
+) -> None:
+    """Validate a charging session and apply efficiency learning if valid."""
+    soc_gain = end_soc - anchor_soc
+    if soc_gain < MIN_LEARNING_SOC_GAIN:
+        _LOGGER.debug(
+            "SOC: Discarding %s for %s: SOC gain %.1f%% below minimum %.1f%%",
+            label,
+            redact_vin(vin),
+            soc_gain,
+            MIN_LEARNING_SOC_GAIN,
+        )
+        return
+
+    if total_energy_kwh <= 0:
+        _LOGGER.debug("SOC: Discarding %s for %s: no energy recorded", label, redact_vin(vin))
+        return
+
+    energy_stored_kwh = (soc_gain / 100.0) * battery_capacity_kwh
+    true_efficiency = energy_stored_kwh / total_energy_kwh
+
+    if not MIN_VALID_EFFICIENCY <= true_efficiency <= MAX_VALID_EFFICIENCY:
+        _LOGGER.debug(
+            "SOC: Discarding %s for %s: efficiency %.2f outside valid range [%.2f, %.2f]",
+            label,
+            redact_vin(vin),
+            true_efficiency,
+            MIN_VALID_EFFICIENCY,
+            MAX_VALID_EFFICIENCY,
+        )
+        return
+
+    _apply_learning(
+        learned_efficiency,
+        on_learning_updated,
+        vin,
+        charging_method,
+        true_efficiency,
+        phases=phases,
+        voltage=voltage,
+        current=current,
+    )
+
+
+def _finalize_learning(
+    learned_efficiency: dict[str, LearnedEfficiency],
+    on_learning_updated: Any,
+    vin: str,
+    session: ChargingSession,
+    end_soc: float,
+) -> None:
+    """Finalize learning from a completed session."""
+    if session.restored:
+        _LOGGER.info(
+            "SOC: Skipping learning for restored session %s (energy data incomplete)",
+            redact_vin(vin),
+        )
+        return
+
+    # Prefer session-level fields (survive re-anchors) over segment-level
+    start_soc = session.session_start_soc if session.session_start_soc is not None else session.anchor_soc
+    energy = session.session_total_energy_kwh if session.session_total_energy_kwh > 0 else session.total_energy_kwh
+
+    _validate_and_learn(
+        learned_efficiency,
+        on_learning_updated,
+        vin,
+        anchor_soc=start_soc,
+        total_energy_kwh=energy,
+        battery_capacity_kwh=session.battery_capacity_kwh,
+        charging_method=session.charging_method,
+        phases=session.phases,
+        voltage=session.last_voltage if session.last_voltage else 230.0,
+        current=session.last_current if session.last_current else 16.0,
+        end_soc=end_soc,
+        label="session",
+    )
+
+
+def _finalize_learning_from_pending(
+    learned_efficiency: dict[str, LearnedEfficiency],
+    on_learning_updated: Any,
+    vin: str,
+    pending: PendingSession,
+    end_soc: float,
+) -> None:
+    """Finalize learning from a pending session."""
+    _validate_and_learn(
+        learned_efficiency,
+        on_learning_updated,
+        vin,
+        anchor_soc=pending.anchor_soc,
+        total_energy_kwh=pending.total_energy_kwh,
+        battery_capacity_kwh=pending.battery_capacity_kwh,
+        charging_method=pending.charging_method,
+        phases=pending.phases,
+        voltage=pending.voltage,
+        current=pending.current,
+        end_soc=end_soc,
+        label="pending session",
+    )
+
+
+def _apply_learning(
+    learned_efficiency: dict[str, LearnedEfficiency],
+    on_learning_updated: Any,
+    vin: str,
+    charging_method: str,
+    true_efficiency: float,
+    phases: int = 1,
+    voltage: float = 230.0,
+    current: float = 16.0,
+) -> None:
+    """Apply learned efficiency with charging condition tracking."""
+    learned = learned_efficiency.setdefault(vin, LearnedEfficiency())
+
+    is_dc = charging_method == "DC"
+
+    condition = learned.get_dc_condition() if is_dc else learned.get_condition(phases, voltage, current)
+    accepted = learned.update_efficiency(phases, voltage, current, is_dc, true_efficiency)
+
+    entry = learned.efficiency_matrix.get(condition)
+    if accepted:
+        if is_dc:
+            _LOGGER.info(
+                "%s: Learned DC efficiency [DC/%dV]: %.2f%% (session %d)",
+                redact_vin(vin),
+                condition.voltage_bracket,
+                entry.efficiency * 100 if entry else 0,
+                entry.sample_count if entry else 0,
+            )
+        else:
+            _LOGGER.info(
+                "%s: Learned AC efficiency [%dP, %dV, %dA]: %.2f%% (session %d for this config)",
+                redact_vin(vin),
+                condition.phases,
+                condition.voltage_bracket,
+                condition.current_bracket,
+                entry.efficiency * 100 if entry else 0,
+                entry.sample_count if entry else 0,
+            )
+
+        # Trigger persistence callback
+        if on_learning_updated:
+            on_learning_updated(vin)
+    else:
+        if is_dc:
+            _LOGGER.warning(
+                "%s: Rejected DC efficiency outlier [DC/%dV]: %.2f%%",
+                redact_vin(vin),
+                condition.voltage_bracket,
+                true_efficiency * 100,
+            )
+        else:
+            _LOGGER.warning(
+                "%s: Rejected efficiency outlier [%dP, %dV, %dA]: %.2f%%",
+                redact_vin(vin),
+                condition.phases,
+                condition.voltage_bracket,
+                condition.current_bracket,
+                true_efficiency * 100,
+            )
+
+
+def get_efficiency(
+    learned_efficiency: dict[str, LearnedEfficiency],
+    vin: str,
+    charging_method: str,
+    phases: int = 1,
+    voltage: float = 230.0,
+    current: float = 16.0,
+) -> float:
+    """Get efficiency for prediction, using learned value if available.
+
+    Args:
+        learned_efficiency: Dictionary mapping VIN to LearnedEfficiency
+        vin: Vehicle identification number
+        charging_method: "AC" or "DC"
+        phases: Number of phases (1 or 3)
+        voltage: Voltage in volts
+        current: Current in amps
+
+    Returns:
+        Efficiency to use for prediction
+    """
+    learned = learned_efficiency.get(vin)
+    if not learned:
+        learned = _DEFAULT_EFFICIENCY
+
+    is_dc = charging_method == "DC"
+    return learned.get_efficiency(phases, voltage, current, is_dc, vin)

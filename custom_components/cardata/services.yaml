@@ -25,3 +25,102 @@ fetch_basic_data:
     vin:
       description: Optional VIN to query. Defaults to the VIN stored in the config entry.
       example: WBY31AW090FP15359
+migrate_entity_ids:
+  name: Migrate Entity IDs
+  description: Developer tool to migrate entity IDs from old format to new format. Use dry_run to preview changes without applying them.
+  fields:
+    entry_id:
+      description: Optional config entry id to target. If omitted, runs for all entries.
+      example: 01K65NKFESKBQZ78PBW6V9BCCX
+    force:
+      description: Force migration even if entities appear already migrated.
+      selector:
+        boolean:
+    dry_run:
+      description: Preview changes without applying them (logs planned actions only).
+      selector:
+        boolean:
+clean_hv_containers:
+  name: Clean HV Containers
+  description: Developer tool to list or delete high-voltage battery telemetry containers.
+  fields:
+    entry_id:
+      description: Optional config entry id to target. Required if multiple entries are configured.
+      example: 01K65NKFESKBQZ78PBW6V9BCCX
+    action:
+      name: Action
+      description: Action to perform.
+      required: true
+      default: list
+      selector:
+        select:
+          options:
+            - label: "List containers"
+              value: "list"
+            - label: "Delete all containers"
+              value: "delete_all"
+            - label: "Delete matching containers"
+              value: "delete_all_matching"
+            - label: "Delete specific container"
+              value: "delete"
+    container_id:
+      description: Container ID to delete (required when action is 'delete').
+      example: 550e8400-e29b-41d4-a716-446655440000
+fetch_vehicle_images:
+  name: Fetch Vehicle Images
+  description: Manually fetch vehicle images for all configured vehicles.
+fetch_charging_history:
+  name: Fetch Charging History
+  description: Fetch charging session history for a VIN (last 30 days). Uses 1 API call per vehicle.
+  fields:
+    entry_id:
+      description: Optional config entry id to target. Required if multiple entries are configured.
+      example: 01K65NKFESKBQZ78PBW6V9BCCX
+    vin:
+      description: Optional VIN to query. If omitted, fetches for all known VINs.
+      example: WBY31AW090FP15359
+fetch_tyre_diagnosis:
+  name: Fetch Tyre Diagnosis
+  description: Fetch tyre health and wear data for a VIN. Uses 1 API call per vehicle.
+  fields:
+    entry_id:
+      description: Optional config entry id to target. Required if multiple entries are configured.
+      example: 01K65NKFESKBQZ78PBW6V9BCCX
+    vin:
+      description: Optional VIN to query. If omitted, fetches for all known VINs.
+      example: WBY31AW090FP15359
+update_charging_power:
+  name: Update Charging Power
+  description: >
+    Inject a locally measured charging power reading into the SOC predictor.
+    While a local reading is fresh, BMW-sourced V×A values are suppressed so
+    the meter's view wins. Requires the "Use external power meter for charging"
+    option to be enabled for the entry. Intended to be called repeatedly from an
+    automation driven by a smart meter (e.g. every 10-30 seconds).
+  fields:
+    entry_id:
+      description: Optional config entry id to target. Required if multiple entries are configured.
+      example: 01K65NKFESKBQZ78PBW6V9BCCX
+    vin:
+      description: VIN of the vehicle being charged.
+      required: true
+      example: WBY31AW090FP15359
+    power_kw:
+      description: Gross charging power delivered to the vehicle, in kW.
+      required: true
+      example: 2.3
+      selector:
+        number:
+          min: 0
+          max: 350
+          step: 0.01
+          unit_of_measurement: kW
+    aux_power_kw:
+      description: Optional auxiliary (preheating etc.) power in kW. Defaults to 0.
+      example: 0.3
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 0.01
+          unit_of_measurement: kW

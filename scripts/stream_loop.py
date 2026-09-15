@@ -1,3 +1,28 @@
+# Copyright (c) 2025, Jyri Saukkonen <jyri.saukkonen+jjyksi@gmail.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
 #!/usr/bin/env python3
 """Periodic token refresher plus MQTT stream consumer for BMW CarData."""
 
@@ -110,7 +135,6 @@ def build_client(
     client.reconnect_delay_set(min_delay=5, max_delay=60)
 
     client.on_connect = on_connect
-    client.on_connack = on_connack
     client.on_message = on_message
     client.on_disconnect = on_disconnect
     client.on_subscribe = on_subscribe
@@ -140,10 +164,6 @@ def on_message(client: mqtt.Client, userdata, msg: mqtt.MQTTMessage):
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     payload = msg.payload.decode(errors="replace")
     print(f"[{timestamp}] {msg.topic}: {payload}")
-
-
-def on_connack(client, userdata, reason_code, flags, properties):  # type: ignore[override]
-    print(f"CONNACK received: reason_code={reason_code}, flags={flags}")
 
 
 def on_disconnect(client: mqtt.Client, userdata, disconnect_flags, reason_code, properties=None):
